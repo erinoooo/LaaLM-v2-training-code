@@ -6,7 +6,7 @@ Converts .pt to safetensors + generates required HF files
 import torch
 import json
 from pathlib import Path
-from safetensors.torch import save_file
+from safetensors.torch import save_model
 import shutil
 from dataclasses import dataclass
 
@@ -56,9 +56,26 @@ def package():
     
     print(f"Model: {config.n_params/1e6:.1f}M parameters")
     
-    # 1. Convert to safetensors
+    # Clean up state dict (remove _orig_mod prefix from torch.compile)
+    print("Cleaning state dict...")
+    cleaned_state = {}
+    for key, value in model_state.items():
+        # Remove _orig_mod. prefix if present
+        clean_key = key.replace('_orig_mod.', '')
+        cleaned_state[clean_key] = value
+    
+    # 1. Convert to safetensors (use save_model to handle shared tensors)
     print("Converting to safetensors...")
-    save_file(model_state, str(output_dir / "model.safetensors"))
+    # Create a dummy model object to use save_model
+    class DummyModel:
+        def __init__(self, state_dict):
+            self.state_dict_data = state_dict
+        
+        def state_dict(self):
+            return self.state_dict_data
+    
+    dummy_model = DummyModel(cleaned_state)
+    save_model(dummy_model, str(output_dir / "model.safetensors"))
     
     # 2. Create config.json
     print("Creating config.json...")
@@ -75,6 +92,7 @@ def package():
         "attention_dropout_prob": config.dropout,
         "rms_norm_eps": 1e-6,
         "torch_dtype": "bfloat16",
+        "tie_word_embeddings": True,  # Important for weight tying
     }
     with open(output_dir / "config.json", 'w') as f:
         json.dump(hf_config, f, indent=2)
