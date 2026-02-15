@@ -1,6 +1,6 @@
 """
-Train a custom BPE tokenizer for LaaLM-v2
-Optimized for Linux commands and terminal output
+Train tokenizer v3 for LaaLM-v2
+Includes special delimiter tokens
 """
 
 from tokenizers import Tokenizer
@@ -10,174 +10,115 @@ from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 import json
 
-# Configuration
-TRAINING_DATA = "laalm_v2_training_data.jsonl"
-VOCAB_SIZE = 8000  # Small vocab for 200-300M model
-OUTPUT_PATH = "laalm_v2_tokenizer.json"
+# Config
+TRAINING_DATA = "laalm_v2_training_data_v3.jsonl"
+VOCAB_SIZE = 8000
+OUTPUT_PATH = "laalm_v2_tokenizer_v3.json"
 
-
-def extract_text_from_jsonl(filename):
+def extract_text():
     """Extract all text from training conversations"""
     print("Extracting text from training data...")
-
+    
     texts = []
-    with open(filename, 'r') as f:
+    with open(TRAINING_DATA, 'r') as f:
         for i, line in enumerate(f):
             if (i + 1) % 1000 == 0:
                 print(f"  Processed {i + 1} conversations...")
-
+            
             conv = json.loads(line)
-            for msg in conv['messages']:
-                texts.append(msg['content'])
-
-    print(f"✓ Extracted {len(texts)} messages")
+            texts.append(conv['text'])
+    
+    print(f"✓ Extracted {len(texts)} conversations")
     return texts
 
-
 def train_tokenizer(texts):
-    """Train BPE tokenizer"""
+    """Train BPE tokenizer with special delimiters"""
     print(f"\nTraining tokenizer with vocab size {VOCAB_SIZE}...")
-
-    # Initialize BPE tokenizer
+    
+    # Initialize
     tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-
-    # Use ByteLevel pre-tokenizer (works well for all text including special chars)
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
     tokenizer.decoder = ByteLevelDecoder()
-
-    # Special tokens for our use case
+    
+    # Special tokens - INCLUDING delimiters
     special_tokens = [
-        "<pad>",  # Padding
-        "<unk>",  # Unknown
-        "<s>",  # Start of sequence
-        "</s>",  # End of sequence
-        "<REASON>",  # CoT reasoning start
-        "</REASON>",  # CoT reasoning end
-        "OUTPUT:",  # Output marker
+        "<pad>",
+        "<unk>",
+        "<s>",
+        "</s>",
+        "### SYSTEM ###",
+        "### END SYSTEM ###",
+        "### COMMAND ###",
+        "### END COMMAND ###",
+        "### OUTPUT ###",
+        "### END OUTPUT ###",
+        "<REASON>",
+        "</REASON>",
     ]
-
-    # Trainer configuration
+    
+    # Train
     trainer = BpeTrainer(
         vocab_size=VOCAB_SIZE,
         special_tokens=special_tokens,
         show_progress=True,
         min_frequency=2,
     )
-
-    # Train on extracted texts
+    
     tokenizer.train_from_iterator(texts, trainer=trainer)
-
     print("✓ Tokenizer trained!")
     return tokenizer
 
-
 def test_tokenizer(tokenizer):
-    """Test tokenizer on sample commands"""
-    print("\n" + "=" * 60)
+    """Test tokenizer"""
+    print("\n" + "="*60)
     print("TOKENIZER TESTS")
-    print("=" * 60)
-
+    print("="*60)
+    
     test_cases = [
-        "ls -la",
+        "### COMMAND ###\nls\n### END COMMAND ###",
+        "### OUTPUT ###\nfile.txt\n### END OUTPUT ###",
         "cat file.txt | grep error",
-        "echo hello > test.txt",
-        "<REASON>\nSTEP1: execute(cat file.txt)\n</REASON>",
-        "rm: cannot remove 'file.txt': No such file or directory",
-        "/home/user/docs",
-        "pwd",
-        "OUTPUT:\ntest.txt\ndata.log",
+        "<REASON>\nSTEP1: execute(ls)\n</REASON>",
     ]
-
+    
     for text in test_cases:
         encoded = tokenizer.encode(text)
         decoded = tokenizer.decode(encoded.ids)
-
-        print(f"\nOriginal: {repr(text)}")
-        print(f"Tokens:   {encoded.tokens[:15]}{'...' if len(encoded.tokens) > 15 else ''}")
-        print(f"IDs:      {encoded.ids[:15]}{'...' if len(encoded.ids) > 15 else ''}")
-        print(f"Decoded:  {repr(decoded)}")
-
-        if text != decoded:
-            print(f"⚠ Mismatch (this is OK for ByteLevel tokenizer)")
-
+        
+        print(f"\nOriginal: {repr(text[:50])}")
+        print(f"Tokens:   {encoded.tokens[:10]}")
+        print(f"Decoded:  {repr(decoded[:50])}")
+    
     print("\n✓ Tests complete!")
 
-
 def save_tokenizer(tokenizer, path):
-    """Save tokenizer to file"""
+    """Save tokenizer"""
     print(f"\nSaving tokenizer to {path}...")
     tokenizer.save(path)
     print("✓ Saved!")
 
-
-def print_vocab_stats(tokenizer):
-    """Print vocabulary statistics"""
-    print("\n" + "=" * 60)
-    print("VOCABULARY STATISTICS")
-    print("=" * 60)
-
-    vocab_size = tokenizer.get_vocab_size()
-    print(f"Vocabulary size: {vocab_size}")
-
-    # Sample some tokens
-    vocab = tokenizer.get_vocab()
-    sample_tokens = list(vocab.items())[:30]
-
-    print("\nFirst 30 tokens:")
-    for token, idx in sample_tokens:
-        print(f"  {idx:4d}: {repr(token)}")
-
-    # Check for important command tokens
-    important_tokens = [
-        "ls", "cat", "grep", "echo", "pwd", "cd", "rm", "mv", "cp",
-        "touch", "mkdir", "head", "tail", "wc", "find",
-        "|", ">", ">>", "/", ".", ".txt", ".log",
-        "error", "cannot", "file", "directory"
-    ]
-
-    print(f"\nChecking for important tokens...")
-    found = 0
-    for token in important_tokens:
-        # ByteLevel tokens are encoded, so we check if encoding exists
-        try:
-            enc = tokenizer.encode(token)
-            if len(enc.tokens) <= 3:  # Token exists as a unit or small merge
-                found += 1
-                print(f"  ✓ {token} -> {enc.tokens}")
-        except:
-            pass
-
-    print(f"\nFound ~{found} important token patterns")
-
-
 def main():
-    print("=" * 60)
-    print("LaaLM-v2 TOKENIZER TRAINING")
-    print("=" * 60)
+    print("="*60)
+    print("LaaLM-v2.1 TOKENIZER TRAINING")
+    print("="*60)
     print()
-
-    # Extract text from training data
-    texts = extract_text_from_jsonl(TRAINING_DATA)
-
-    # Train tokenizer
+    
+    texts = extract_text()
     tokenizer = train_tokenizer(texts)
-
-    # Test tokenizer
     test_tokenizer(tokenizer)
-
-    # Print stats
-    print_vocab_stats(tokenizer)
-
-    # Save tokenizer
     save_tokenizer(tokenizer, OUTPUT_PATH)
-
-    print("\n" + "=" * 60)
+    
+    print("\n" + "="*60)
     print("✓ TOKENIZER TRAINING COMPLETE!")
-    print("=" * 60)
+    print("="*60)
     print(f"\nTokenizer saved to: {OUTPUT_PATH}")
     print(f"Vocabulary size: {VOCAB_SIZE}")
-    print("\nYou can now use this tokenizer for training LaaLM-v2!")
-
+    print("\nSpecial tokens learned:")
+    print("  - ### COMMAND ###")
+    print("  - ### END COMMAND ###")
+    print("  - ### OUTPUT ###")
+    print("  - ### END OUTPUT ###")
+    print("\nReady for training LaaLM-v2.1!")
 
 if __name__ == "__main__":
     main()
