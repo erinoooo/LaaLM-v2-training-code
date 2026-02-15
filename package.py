@@ -8,6 +8,34 @@ import json
 from pathlib import Path
 from safetensors.torch import save_file
 import shutil
+from dataclasses import dataclass
+
+# Import ModelConfig from training script
+@dataclass
+class ModelConfig:
+    vocab_size: int = 8000
+    d_model: int = 768
+    n_layers: int = 12
+    n_heads: int = 12
+    d_ff: int = 3072
+    max_seq_len: int = 512
+    dropout: float = 0.1
+    
+    def __post_init__(self):
+        self.n_params = self.calculate_params()
+    
+    def calculate_params(self):
+        emb = self.vocab_size * self.d_model
+        pos_emb = self.max_seq_len * self.d_model
+        attn_qkv = 3 * self.d_model * self.d_model
+        attn_out = self.d_model * self.d_model
+        ffn = 2 * self.d_model * self.d_ff
+        layer_norm = 2 * 2 * self.d_model
+        per_layer = attn_qkv + attn_out + ffn + layer_norm
+        final_ln = 2 * self.d_model
+        lm_head = self.vocab_size * self.d_model
+        total = emb + pos_emb + (per_layer * self.n_layers) + final_ln + lm_head
+        return total
 
 # Config
 CHECKPOINT_PATH = "checkpoints/laalm_v2_final.pt"
@@ -21,10 +49,12 @@ def package():
     
     print(f"Packaging model to {OUTPUT_DIR}/")
     
-    # Load checkpoint (weights_only=False for PyTorch 2.6+)
+    # Load checkpoint
     checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
     model_state = checkpoint['model_state_dict']
     config = checkpoint['config']
+    
+    print(f"Model: {config.n_params/1e6:.1f}M parameters")
     
     # 1. Convert to safetensors
     print("Converting to safetensors...")
@@ -92,7 +122,8 @@ def package():
     print(f"\n✓ Done! Model packaged in {OUTPUT_DIR}/")
     print("\nFiles:")
     for f in sorted(output_dir.iterdir()):
-        print(f"  - {f.name}")
+        size = f.stat().st_size / (1024*1024)
+        print(f"  - {f.name} ({size:.1f} MB)")
 
 if __name__ == "__main__":
     package()
