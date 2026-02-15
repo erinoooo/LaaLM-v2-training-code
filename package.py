@@ -21,8 +21,8 @@ def package():
     
     print(f"Packaging model to {OUTPUT_DIR}/")
     
-    # Load checkpoint
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu')
+    # Load checkpoint (weights_only=False for PyTorch 2.6+)
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
     model_state = checkpoint['model_state_dict']
     config = checkpoint['config']
     
