@@ -62,9 +62,9 @@ class TrainConfig:
     tokenizer_path: str = "laalm_v2_tokenizer.json"
     
     # Training
-    batch_size: int = 16
-    gradient_accumulation_steps: int = 4  # Effective batch = 64
-    max_steps: int = 50000
+    batch_size: int = 128
+    gradient_accumulation_steps: int = 1  # Effective batch = 64
+    max_steps: int = 30000
     warmup_steps: int = 2000
     eval_interval: int = 500
     save_interval: int = 2000
