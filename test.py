@@ -6,7 +6,7 @@ Uses v3 delimiter format matching training data
 import torch
 from tokenizers import Tokenizer
 
-from model import ModelConfig, LaaLMModel
+from model import LaaLMv2Config, LaaLMModel
 
 # ============================================================================
 # INFERENCE ENGINE

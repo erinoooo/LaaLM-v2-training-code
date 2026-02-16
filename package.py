@@ -9,7 +9,7 @@ from pathlib import Path
 from safetensors.torch import save_file
 import shutil
 
-from model import ModelConfig, LaaLMModel
+from model import LaaLMv2Config, LaaLMModel
 
 # Config - paths match train.py output
 CHECKPOINT_PATH = "checkpoints_v2/laalm_v2_final.pt"

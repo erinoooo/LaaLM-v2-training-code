@@ -16,7 +16,7 @@ from tqdm import tqdm
 import wandb
 from dataclasses import dataclass
 
-from model import ModelConfig, LaaLMModel
+from model import LaaLMv2Config, LaaLMModel
 
 # ============================================================================
 # CONFIG
@@ -108,7 +108,7 @@ def get_lr(step, config):
     return config.learning_rate * 0.1 + coeff * (config.learning_rate - config.learning_rate * 0.1)
 
 def train():
-    model_config = ModelConfig()
+    model_config = LaaLMv2Config()
     train_config = TrainConfig()
 
     print(f"Model has {model_config.n_params/1e6:.1f}M parameters")
