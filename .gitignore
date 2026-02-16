@@ -1,0 +1,29 @@
+# Training data
+*.jsonl
+
+# Model checkpoints
+checkpoints/
+checkpoints_v2/
+*.pt
+
+# Packaged model output
+laalm-v2/
+
+# Tokenizer artifacts
+laalm_v2_tokenizer*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Weights & Biases
+wandb/
