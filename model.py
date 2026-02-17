@@ -77,7 +77,7 @@ class LaaLMv2Config(LaaLMConfig):
     n_layers: int = 20
     n_heads: int = 16
     d_ff: int = 2816
-    max_seq_len: int = 4096
+    max_seq_len: int = 1024
     dropout: float = 0.05
     use_swiglu: bool = True
 
