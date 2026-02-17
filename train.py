@@ -85,7 +85,7 @@ class LaaLMDataset(Dataset):
     Result: zero padding, zero waste, 99%+ token utilization.
     """
 
-    def __init__(self, data_path, tokenizer, max_len=1024):
+    def __init__(self, data_path, tokenizer, max_len=8192):
         self.max_len = max_len
         eos_id = tokenizer.token_to_id("</s>")
         if eos_id is None:
