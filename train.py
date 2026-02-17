@@ -43,15 +43,15 @@ class TrainConfig:
     val_split_ratio: float = 0.05  # Fallback if val file doesn't exist
 
     # Training — all step counts are OPTIMIZER steps (not micro-batches)
-    batch_size: int = 16
-    gradient_accumulation_steps: int = 4  # Effective batch = 64
-    max_steps: int = 30000   # 30K optimizer steps
-    warmup_steps: int = 2000
+    batch_size: int = 8
+    gradient_accumulation_steps: int = 8  # Effective batch = 64
+    max_steps: int = 50000   # 50K optimizer steps
+    warmup_steps: int = 3000
     eval_interval: int = 500
     save_interval: int = 2000
 
     # Optimizer
-    learning_rate: float = 3e-4
+    learning_rate: float = 2e-4
     min_lr_ratio: float = 0.01  # Minimum LR = learning_rate * 0.01
     weight_decay: float = 0.1
     beta1: float = 0.9
