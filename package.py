@@ -11,8 +11,11 @@ import shutil
 
 from model import LaaLMv2Config, LaaLMModel
 
-# Config - paths match train.py output
-CHECKPOINT_PATH = "checkpoints_v2/laalm_v2_final.pt"
+# Config — prefer best model checkpoint, fall back to final
+import os
+BEST_PATH = "checkpoints_v2/laalm_v2_best.pt"
+FINAL_PATH = "checkpoints_v2/laalm_v2_final.pt"
+CHECKPOINT_PATH = BEST_PATH if os.path.exists(BEST_PATH) else FINAL_PATH
 TOKENIZER_PATH = "laalm_v2_tokenizer_v3.json"
 OUTPUT_DIR = "laalm-v2"
 
@@ -61,6 +64,7 @@ def package():
         "max_position_embeddings": config.max_seq_len,
         "hidden_dropout_prob": config.dropout,
         "attention_dropout_prob": config.dropout,
+        "use_swiglu": getattr(config, 'use_swiglu', False),
         "rms_norm_eps": 1e-6,
         "torch_dtype": "bfloat16",
         "tie_word_embeddings": True,

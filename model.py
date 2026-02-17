@@ -3,6 +3,7 @@ LaaLM Model Architecture
 Shared module with base configuration and version-specific configs
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +29,7 @@ class LaaLMConfig:
     d_ff: int
     max_seq_len: int
     dropout: float = 0.1
+    use_swiglu: bool = False
 
     def __post_init__(self):
         """Validate configuration and compute derived values."""
@@ -43,9 +45,12 @@ class LaaLMConfig:
 
         # Per-layer parameters
         attn_qkv = 3 * self.d_model * self.d_model  # Q, K, V projections
-        attn_out = self.d_model * self.d_model      # Output projection
-        ffn = 2 * self.d_model * self.d_ff          # FFN up and down projections
-        layer_norm = 2 * self.d_model              # 2 RMSNorms per layer (each has 1 weight vector)
+        attn_out = self.d_model * self.d_model       # Output projection
+        if self.use_swiglu:
+            ffn = 3 * self.d_model * self.d_ff  # w1 (gate) + w3 (up) + w2 (down)
+        else:
+            ffn = 2 * self.d_model * self.d_ff  # w1 (up) + w2 (down)
+        layer_norm = 2 * self.d_model  # 2 RMSNorms per layer
         per_layer = attn_qkv + attn_out + ffn + layer_norm
 
         # Final layer norm
@@ -63,16 +68,18 @@ class LaaLMv2Config(LaaLMConfig):
     v2 uses:
     - 8K vocab with BPE tokenization
     - 768 hidden dim, 12 layers, 12 heads (~85M parameters)
-    - 512 max sequence length
+    - SwiGLU FFN with d_ff=2048 (same param count as plain FFN d_ff=3072)
+    - 1024 max sequence length for full conversation context
     - Trained on unambiguous delimiter format with reasoning traces
     """
     vocab_size: int = 8000
     d_model: int = 768
     n_layers: int = 12
     n_heads: int = 12
-    d_ff: int = 3072
-    max_seq_len: int = 512
-    dropout: float = 0.1
+    d_ff: int = 2048
+    max_seq_len: int = 1024
+    dropout: float = 0.05
+    use_swiglu: bool = True
 
 
 # ============================================================================
@@ -128,7 +135,6 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.n_heads = config.n_heads
         self.head_dim = config.head_dim
-        self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
@@ -163,16 +169,32 @@ class MultiHeadAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Feed-forward network with SiLU activation."""
+    """Feed-forward network.
+
+    Supports two modes:
+    - Standard: w2(silu(w1(x)))
+    - SwiGLU:   w2(silu(w1(x)) * w3(x))
+
+    SwiGLU is empirically better at the same parameter count.
+    With SwiGLU, use d_ff = 2/3 * original_d_ff to keep param count equal.
+    """
 
     def __init__(self, config: LaaLMConfig):
         super().__init__()
+        self.use_swiglu = config.use_swiglu
+
         self.w1 = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.w2 = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
+        if self.use_swiglu:
+            self.w3 = nn.Linear(config.d_model, config.d_ff, bias=False)
+
     def forward(self, x):
-        return self.dropout(self.w2(F.silu(self.w1(x))))
+        if self.use_swiglu:
+            return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        else:
+            return self.dropout(self.w2(F.silu(self.w1(x))))
 
 
 class TransformerBlock(nn.Module):
@@ -195,10 +217,11 @@ class LaaLMModel(nn.Module):
     """LaaLM Language Model.
 
     A decoder-only transformer model with:
-    - Token embeddings
+    - Token embeddings with weight tying
     - Rotary position embeddings (RoPE)
     - Pre-norm transformer blocks with RMSNorm
-    - Weight tying between embeddings and output layer
+    - SwiGLU or SiLU feed-forward networks
+    - Scaled residual initialization for training stability
     """
 
     def __init__(self, config: LaaLMConfig):
@@ -222,6 +245,13 @@ class LaaLMModel(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Scale residual projections (out_proj, w2) by 1/sqrt(2*n_layers)
+        # for training stability in deep networks
+        residual_std = 0.02 / math.sqrt(2 * config.n_layers)
+        for pn, p in self.named_parameters():
+            if pn.endswith('out_proj.weight') or pn.endswith('w2.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=residual_std)
 
     def _init_weights(self, module):
         """Initialize weights with small random values."""
@@ -280,7 +310,7 @@ class LaaLMModel(nn.Module):
         Args:
             idx: Starting token indices [B, T]
             max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature (1.0 = unchanged, 0 = greedy)
+            temperature: Sampling temperature (1.0 = unchanged, <1 = sharper)
             top_k: If set, only sample from top k tokens
             stop_token: If set, stop when this token is generated
 
@@ -293,7 +323,18 @@ class LaaLMModel(nn.Module):
 
             # Forward pass
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :]
+
+            # Temperature scaling
+            if temperature > 0:
+                logits = logits / temperature
+            else:
+                # Greedy
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+                idx = torch.cat((idx, idx_next), dim=1)
+                if stop_token is not None and idx_next.item() == stop_token:
+                    break
+                continue
 
             # Optional top-k filtering
             if top_k is not None:
@@ -302,10 +343,7 @@ class LaaLMModel(nn.Module):
 
             # Sample
             probs = F.softmax(logits, dim=-1)
-            if temperature == 0:
-                idx_next = torch.argmax(probs, dim=-1, keepdim=True)
-            else:
-                idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = torch.multinomial(probs, num_samples=1)
 
             # Append
             idx = torch.cat((idx, idx_next), dim=1)
