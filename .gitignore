@@ -1,5 +1,6 @@
 # Training data
 *.jsonl
+splits/
 
 # Model checkpoints
 checkpoints/

@@ -6,7 +6,7 @@ Uses v3 delimiter format matching training data
 import torch
 from tokenizers import Tokenizer
 
-from model import ModelConfig, LaaLMModel
+from model import LaaLMv2Config, LaaLMModel
 
 # ============================================================================
 # INFERENCE ENGINE
@@ -30,6 +30,7 @@ class LaaLMTerminal:
 
         print(f"Model loaded: {config.n_params/1e6:.1f}M parameters")
 
+        self.max_seq_len = config.max_seq_len
         self.conversation = []
         # System prompt matches training data format exactly
         self.system_prompt = (
@@ -57,10 +58,10 @@ class LaaLMTerminal:
         conv_text += f"### COMMAND ###\n{command}\n### END COMMAND ###\n\n"
         conv_text += "### OUTPUT ###\n"
 
-        # Tokenize (keep last 400 tokens for context window)
+        # Tokenize (keep last max_seq_len tokens for context window)
         encoded = self.tokenizer.encode(conv_text)
         input_ids = torch.tensor(
-            [encoded.ids[-400:]], dtype=torch.long
+            [encoded.ids[-self.max_seq_len:]], dtype=torch.long
         ).to(self.device)
 
         # Generate
@@ -124,8 +125,14 @@ def main():
     print("=" * 60)
     print()
 
+    # Prefer best model (lowest val loss) if available, fall back to final
+    import os
+    best_path = "checkpoints_v2/laalm_v2_best.pt"
+    final_path = "checkpoints_v2/laalm_v2_final.pt"
+    checkpoint_path = best_path if os.path.exists(best_path) else final_path
+
     terminal = LaaLMTerminal(
-        checkpoint_path="checkpoints_v2/laalm_v2_final.pt",
+        checkpoint_path=checkpoint_path,
         tokenizer_path="laalm_v2_tokenizer_v3.json",
         device="cuda" if torch.cuda.is_available() else "cpu",
     )

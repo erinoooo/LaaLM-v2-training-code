@@ -1,6 +1,18 @@
 """
 LaaLM-v2 Data Generator v3 - UNAMBIGUOUS FORMAT
 Clear delimiters, no hallucination potential
+
+Features:
+  - Full recursive in-memory filesystem with path resolution (., .., ~)
+  - Pipes (|) with head, tail, grep, wc
+  - head, tail, wc, find, grep (-i, -c), mkdir -p, rm -rf
+  - Reasoning traces (<REASON>)
+  - Multi-file cat, multi-file touch
+  - Content-aware grep with guarantee_match control
+  - Chaotic + prefix-based filename/dirname generation for diversity
+  - Unknown/gibberish command training
+  - Train/val/test split (80/10/10)
+  - Dataset statistics
 """
 
 import json
@@ -10,10 +22,22 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Configuration
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 NUM_CONVERSATIONS = 17500
 COMMANDS_PER_CONVERSATION = (30, 50)
 OUTPUT_FILE = "laalm_v2_training_data_v3.jsonl"
+
+# Split ratios for train/val/test
+TRAIN_RATIO = 0.8
+VAL_RATIO = 0.1
+# TEST_RATIO is the remainder
+
+# ============================================================================
+# FILESYSTEM
+# ============================================================================
 
 @dataclass
 class FileNode:
@@ -218,39 +242,119 @@ class FileSystem:
         self.cwd = abs_path
         return True
 
-# Random generators
+# ============================================================================
+# RANDOM GENERATORS
+# ============================================================================
+
+# Extended word pools for richer content
+_CONTENT_WORDS = [
+    "hello", "world", "test", "data", "error", "warning", "info", "success",
+    "failed", "processing", "complete", "started", "finished", "running",
+    "system", "user", "admin", "log", "output", "input", "result",
+    "linux", "file", "command", "bash", "terminal", "directory", "content",
+    "example", "server", "client", "request", "response", "timeout",
+    "connection", "network", "process", "thread", "memory", "disk",
+    "configuration", "debug", "trace", "status", "active", "inactive",
+    "enabled", "disabled", "loaded", "initialized", "shutdown", "restart",
+]
+
+_ECHO_PHRASES = [
+    "hello", "test data", "error log", "success", "processing",
+    "hello world", "goodbye", "done", "starting up", "shutting down",
+    "debug mode", "test output", "log entry", "status ok", "ready",
+    "initialization complete", "task finished", "running check",
+    "connection established", "data received", "update pending",
+]
+
+_PREFIX_FILENAMES = [
+    "test", "data", "file", "doc", "report", "output", "temp", "backup",
+    "config", "log", "readme", "notes", "script", "main", "index",
+    "setup", "build", "run", "deploy", "Makefile",
+]
+
+_PREFIX_DIRNAMES = [
+    "docs", "data", "tmp", "backup", "config", "logs", "output",
+    "projects", "files", "archives", "src", "lib", "bin", "var",
+    "scripts", "tests", "build", "dist",
+]
+
+_FILE_EXTENSIONS = [
+    ".txt", ".log", ".dat", ".csv", ".json", ".md", ".py", ".sh",
+    ".conf", ".cfg", ".yaml", ".xml", ".html", ".c", ".h",
+]
+
+
 def random_filename(extension: str = "") -> str:
-    prefixes = ["test", "data", "file", "doc", "report", "output", "temp", "backup", "config", "log"]
-    name = random.choice(prefixes)
-    if random.random() > 0.5:
-        name += "_" + "".join(random.choices(string.digits, k=random.randint(1, 3)))
-    if extension:
-        name += extension
-    elif random.random() > 0.6:
-        ext_choices = [".txt", ".log", ".dat", ".csv", ".json", ".md"]
-        name += random.choice(ext_choices)
-    return name
+    """Generate a filename. Mix of prefix-based (readable) and chaotic (diverse)."""
+    if random.random() < 0.6:
+        # Prefix-based: realistic names like "test_42.txt"
+        name = random.choice(_PREFIX_FILENAMES)
+        if random.random() > 0.4:
+            name += "_" + "".join(random.choices(string.digits, k=random.randint(1, 3)))
+        if extension:
+            name += extension
+        elif random.random() > 0.5:
+            name += random.choice(_FILE_EXTENSIONS)
+        return name
+    else:
+        # Chaotic: random chars for diversity like "xK9_v2.dat"
+        length = random.randint(4, 12)
+        chars = string.ascii_letters + string.digits + "_-"
+        name = "".join(random.choice(chars) for _ in range(length))
+        if extension:
+            name += extension
+        elif random.random() > 0.4:
+            name += random.choice(_FILE_EXTENSIONS)
+        return name
+
 
 def random_dirname() -> str:
-    names = ["docs", "data", "tmp", "backup", "config", "logs", "output", "projects", "files", "archives"]
-    name = random.choice(names)
-    if random.random() > 0.6:
-        name += "_" + "".join(random.choices(string.digits, k=random.randint(1, 2)))
-    return name
+    """Generate a directory name. Mix of prefix-based and chaotic."""
+    if random.random() < 0.6:
+        # Prefix-based
+        name = random.choice(_PREFIX_DIRNAMES)
+        if random.random() > 0.6:
+            name += "_" + "".join(random.choices(string.digits, k=random.randint(1, 2)))
+        return name
+    else:
+        # Chaotic
+        length = random.randint(3, 8)
+        chars = string.ascii_letters + string.digits + "_-"
+        return "".join(random.choice(chars) for _ in range(length))
+
 
 def random_content(lines: int = None) -> str:
+    """Generate random file content with varied line counts."""
     if lines is None:
         lines = random.randint(1, 10)
-    words_pool = [
-        "hello", "world", "test", "data", "error", "warning", "info", "success",
-        "failed", "processing", "complete", "started", "finished", "running",
-        "system", "user", "admin", "log", "output", "input", "result"
-    ]
     content_lines = []
-    for i in range(lines):
-        line_words = random.sample(words_pool, k=random.randint(2, 6))
+    for _ in range(lines):
+        n_words = random.randint(2, 8)
+        line_words = random.choices(_CONTENT_WORDS, k=n_words)
         content_lines.append(" ".join(line_words))
     return "\n".join(content_lines)
+
+
+def random_search_pattern(content: str = None, guarantee_match: bool = True) -> str:
+    """Generate a search pattern for grep.
+
+    If content is provided and guarantee_match is True, picks a word
+    actually present in the content. Otherwise generates a random pattern
+    that is unlikely to match anything.
+    """
+    if guarantee_match and content:
+        words = content.split()
+        # Filter to words that are at least 3 chars (avoids matching everything)
+        words = [w for w in words if len(w) >= 3]
+        if words:
+            return random.choice(words)
+    if guarantee_match:
+        # Fallback to common words that may match generic content
+        return random.choice(["error", "test", "data", "info", "warning",
+                              "system", "log", "output", "user", "file"])
+    # Generate pattern unlikely to match
+    return "".join(random.choices(string.ascii_lowercase, k=random.randint(5, 8)))
+
 
 def _strip_quotes(text: str) -> str:
     """Strip surrounding quotes from a string, like bash does."""
@@ -259,7 +363,11 @@ def _strip_quotes(text: str) -> str:
             return text[1:-1]
     return text
 
-# Command executor
+
+# ============================================================================
+# COMMAND EXECUTOR
+# ============================================================================
+
 class CommandExecutor:
     def __init__(self, fs: FileSystem):
         self.fs = fs
@@ -320,7 +428,15 @@ class CommandExecutor:
                 cmd_parts = part.split()
                 if cmd_parts[0] == "grep" and len(cmd_parts) > 1:
                     pattern = cmd_parts[1]
-                    filtered = [line for line in current_output.split("\n") if pattern in line]
+                    case_insensitive = "-i" in cmd_parts
+                    filtered = []
+                    for line in current_output.split("\n"):
+                        if case_insensitive:
+                            if pattern.lower() in line.lower():
+                                filtered.append(line)
+                        else:
+                            if pattern in line:
+                                filtered.append(line)
                     current_output = "\n".join(filtered)
                     reasoning += f"  -> filtered={len(filtered)} lines\n"
                 elif cmd_parts[0] == "head":
@@ -349,6 +465,10 @@ class CommandExecutor:
                     chars = len(current_output)
                     current_output = f"{lines} {words} {chars}"
                     reasoning += f"  -> {lines}L {words}W {chars}C\n"
+                elif cmd_parts[0] == "sort":
+                    sorted_lines = sorted(current_output.split("\n"))
+                    current_output = "\n".join(sorted_lines)
+                    reasoning += f"  -> sorted {len(sorted_lines)} lines\n"
                 else:
                     current_output = f"bash: {cmd_parts[0]}: cannot use in pipe"
 
@@ -479,14 +599,17 @@ class CommandExecutor:
     def _cat(self, args: List[str]) -> Tuple[str, None]:
         if not args:
             return "cat: missing file operand", None
-        path = args[0]
-        content = self.fs.read_file(path)
-        if content is None:
-            if not self.fs.exists(path):
-                return f"cat: {path}: No such file or directory", None
-            else:
-                return f"cat: {path}: Is a directory", None
-        return content, None
+        # Multi-file cat: concatenate all files
+        outputs = []
+        for path in args:
+            content = self.fs.read_file(path)
+            if content is None:
+                if not self.fs.exists(path):
+                    return f"cat: {path}: No such file or directory", None
+                else:
+                    return f"cat: {path}: Is a directory", None
+            outputs.append(content)
+        return "\n".join(outputs), None
 
     def _echo(self, args: List[str]) -> Tuple[str, None]:
         if ">" in args:
@@ -503,17 +626,38 @@ class CommandExecutor:
         return text, None
 
     def _grep(self, args: List[str]) -> Tuple[str, None]:
-        if len(args) < 2:
+        if not args:
             return "grep: missing operand", None
-        pattern = _strip_quotes(args[0])
-        filename = args[1]
+        # Parse flags
+        case_insensitive = False
+        count_only = False
+        remaining = []
+        for arg in args:
+            if arg == "-i":
+                case_insensitive = True
+            elif arg == "-c":
+                count_only = True
+            elif arg == "-ic" or arg == "-ci":
+                case_insensitive = True
+                count_only = True
+            else:
+                remaining.append(arg)
+        if len(remaining) < 2:
+            return "grep: missing operand", None
+        pattern = _strip_quotes(remaining[0])
+        filename = remaining[1]
         content = self.fs.read_file(filename)
         if content is None:
             if not self.fs.exists(filename):
                 return f"grep: {filename}: No such file or directory", None
             else:
                 return f"grep: {filename}: Is a directory", None
-        matching_lines = [line for line in content.split("\n") if pattern in line]
+        if case_insensitive:
+            matching_lines = [line for line in content.split("\n") if pattern.lower() in line.lower()]
+        else:
+            matching_lines = [line for line in content.split("\n") if pattern in line]
+        if count_only:
+            return str(len(matching_lines)), None
         return "\n".join(matching_lines), None
 
     def _head(self, args: List[str]) -> Tuple[str, None]:
@@ -613,9 +757,31 @@ class CommandExecutor:
         reasoning += "</REASON>"
         return "\n".join(results), reasoning
 
+
 # ============================================================================
 # CONVERSATION GENERATOR - UNAMBIGUOUS FORMAT
 # ============================================================================
+
+def _get_cwd_files(fs: FileSystem) -> List[str]:
+    """Get non-directory files in current directory."""
+    return [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+
+
+def _get_cwd_files_with_content(fs: FileSystem) -> List[str]:
+    """Get files in cwd that have non-empty content."""
+    files = []
+    for f in (fs.list_dir() or []):
+        if not fs.is_directory(f):
+            content = fs.read_file(f)
+            if content:
+                files.append(f)
+    return files
+
+
+def _get_cwd_dirs(fs: FileSystem) -> List[str]:
+    """Get subdirectories in current directory."""
+    return [d for d in (fs.list_dir() or []) if fs.is_directory(d)]
+
 
 def generate_conversation() -> str:
     """Generate conversation with CRYSTAL CLEAR format"""
@@ -628,134 +794,290 @@ def generate_conversation() -> str:
     num_commands = random.randint(*COMMANDS_PER_CONVERSATION)
 
     command_pool = {
-        "create_file": 15, "create_dir": 10, "list": 12, "read_file": 10,
-        "write_to_file": 8, "append_to_file": 4, "move_file": 5, "copy_file": 5,
-        "delete_file": 5, "change_dir": 8, "pwd": 6, "grep_file": 6,
-        "head_file": 4, "tail_file": 4, "wc_file": 3, "pipe_grep": 6,
-        "pipe_head": 4, "pipe_tail": 4, "pipe_wc": 3, "find": 4,
-        "mkdir_p": 3, "rm_rf": 3,
-        "error_no_file": 8, "error_wrong_type": 4,
+        # File creation & writing
+        "create_file": 12, "create_files_multi": 3, "create_dir": 8,
+        "mkdir_p": 3, "write_to_file": 10, "append_to_file": 4,
+        # File reading
+        "list": 10, "list_subdir": 3, "read_file": 7,
+        "read_file_blended": 5, "cat_multi": 3,
+        # File manipulation
+        "move_file": 5, "copy_file": 5, "delete_file": 5, "rm_rf": 3,
+        # Navigation
+        "change_dir": 8, "cd_home": 2, "pwd": 5,
+        # Search & filter
+        "grep_file": 5, "grep_content_aware": 5, "grep_case_insensitive": 3,
+        "grep_count": 2,
+        # head/tail with -n variants
+        "head_file": 3, "head_file_n": 3, "tail_file": 3, "tail_file_n": 3,
+        # Other
+        "wc_file": 3, "find": 4,
+        # Pipes
+        "pipe_grep": 5, "pipe_head": 3, "pipe_tail": 3,
+        "pipe_wc": 3, "pipe_sort": 2, "pipe_grep_wc": 2,
+        # Errors
+        "error_no_file": 6, "error_wrong_type": 4,
+        # Unknown commands
+        "unknown_command": 3,
     }
 
     for _ in range(num_commands):
         action = random.choices(list(command_pool.keys()), weights=list(command_pool.values()))[0]
         command = None
 
+        # === File creation & writing ===
+
         if action == "create_file":
             filename = random_filename()
             command = f"touch {filename}"
+
+        elif action == "create_files_multi":
+            n = random.randint(2, 4)
+            filenames = [random_filename() for _ in range(n)]
+            command = "touch " + " ".join(filenames)
+
         elif action == "create_dir":
             dirname = random_dirname()
             command = f"mkdir {dirname}"
+
         elif action == "mkdir_p":
             d1 = random_dirname()
             d2 = random_dirname()
             command = f"mkdir -p {d1}/{d2}"
-        elif action == "list":
-            dirs = fs.list_dir() or []
-            path = random.choice(dirs) if dirs and random.random() > 0.5 else "."
-            command = f"ls {path}" if path != "." else "ls"
-        elif action == "read_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
-            if files:
-                command = f"cat {random.choice(files)}"
+
         elif action == "write_to_file":
             filename = random_filename()
-            content = random.choice(["hello", "test data", "error log", "success", "processing"])
+            content = random.choice(_ECHO_PHRASES)
             command = f"echo {content} > {filename}"
+
         elif action == "append_to_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
                 filename = random.choice(files)
-                content = random.choice(["more data", "additional info", "update", "new entry"])
+                content = random.choice(_ECHO_PHRASES)
                 command = f"echo {content} >> {filename}"
+
+        # === File reading ===
+
+        elif action == "list":
+            items = fs.list_dir() or []
+            path = random.choice(items) if items and random.random() > 0.5 else "."
+            command = f"ls {path}" if path != "." else "ls"
+
+        elif action == "list_subdir":
+            dirs = _get_cwd_dirs(fs)
+            if dirs:
+                command = f"ls {random.choice(dirs)}"
+
+        elif action == "read_file":
+            files = _get_cwd_files(fs)
+            if files:
+                command = f"cat {random.choice(files)}"
+
+        elif action == "read_file_blended":
+            # Blended cat: sometimes hit, sometimes miss (like the provided code)
+            files = _get_cwd_files(fs)
+            if files and random.random() > 0.2:
+                command = f"cat {random.choice(files)}"
+            else:
+                fake_file = random_filename()
+                # Ensure it doesn't accidentally exist
+                while fs.exists(fake_file):
+                    fake_file = random_filename()
+                command = f"cat {fake_file}"
+
+        elif action == "cat_multi":
+            files = _get_cwd_files(fs)
+            if len(files) >= 2:
+                chosen = random.sample(files, k=min(random.randint(2, 3), len(files)))
+                command = "cat " + " ".join(chosen)
+
+        # === File manipulation ===
+
         elif action == "move_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
-            dirs = [d for d in (fs.list_dir() or []) if fs.is_directory(d)]
+            files = _get_cwd_files(fs)
+            dirs = _get_cwd_dirs(fs)
             if files:
                 src = random.choice(files)
-                # Sometimes move into a directory, sometimes rename
                 if dirs and random.random() > 0.5:
                     command = f"mv {src} {random.choice(dirs)}"
                 else:
                     command = f"mv {src} {random_filename()}"
+
         elif action == "copy_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
-            dirs = [d for d in (fs.list_dir() or []) if fs.is_directory(d)]
+            files = _get_cwd_files(fs)
+            dirs = _get_cwd_dirs(fs)
             if files:
                 src = random.choice(files)
                 if dirs and random.random() > 0.5:
                     command = f"cp {src} {random.choice(dirs)}"
                 else:
                     command = f"cp {src} {random_filename()}"
+
         elif action == "delete_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
                 command = f"rm {random.choice(files)}"
+
         elif action == "rm_rf":
-            dirs = [d for d in (fs.list_dir() or []) if fs.is_directory(d)]
+            dirs = _get_cwd_dirs(fs)
             if dirs:
                 command = f"rm -rf {random.choice(dirs)}"
+
+        # === Navigation ===
+
         elif action == "change_dir":
-            dirs = [d for d in (fs.list_dir() or []) if fs.is_directory(d)]
+            dirs = _get_cwd_dirs(fs)
             if dirs and random.random() > 0.3:
                 command = f"cd {random.choice(dirs)}"
             elif random.random() > 0.5:
                 command = "cd .."
             else:
-                command = "cd"
+                command = "cd ~"
+
+        elif action == "cd_home":
+            command = "cd"
+
         elif action == "pwd":
             command = "pwd"
+
+        # === Search & filter ===
+
         elif action == "grep_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
-                pattern = random.choice(["error", "test", "data", "info", "warning"])
+                pattern = random.choice(["error", "test", "data", "info", "warning",
+                                         "system", "log", "output"])
                 command = f"grep {pattern} {random.choice(files)}"
+
+        elif action == "grep_content_aware":
+            # Content-aware grep: pick pattern from actual file content
+            files_with_content = _get_cwd_files_with_content(fs)
+            if files_with_content:
+                filename = random.choice(files_with_content)
+                content = fs.read_file(filename) or ""
+                if random.random() > 0.4:
+                    # Search for word that exists in file
+                    pattern = random_search_pattern(content, guarantee_match=True)
+                else:
+                    # Search for word unlikely to match
+                    pattern = random_search_pattern(content, guarantee_match=False)
+                command = f"grep {pattern} {filename}"
+
+        elif action == "grep_case_insensitive":
+            files = _get_cwd_files(fs)
+            if files:
+                pattern = random.choice(["Error", "TEST", "Data", "WARNING", "Info"])
+                command = f"grep -i {pattern} {random.choice(files)}"
+
+        elif action == "grep_count":
+            files = _get_cwd_files(fs)
+            if files:
+                pattern = random.choice(["error", "test", "data", "info"])
+                command = f"grep -c {pattern} {random.choice(files)}"
+
+        # === head/tail with -n variants ===
+
         elif action == "head_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
                 command = f"head {random.choice(files)}"
+
+        elif action == "head_file_n":
+            files = _get_cwd_files(fs)
+            if files:
+                n = random.choice([1, 3, 5, 15, 20])
+                command = f"head -n {n} {random.choice(files)}"
+
         elif action == "tail_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
                 command = f"tail {random.choice(files)}"
+
+        elif action == "tail_file_n":
+            files = _get_cwd_files(fs)
+            if files:
+                n = random.choice([1, 3, 5, 15, 20])
+                command = f"tail -n {n} {random.choice(files)}"
+
+        # === Other ===
+
         elif action == "wc_file":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
                 command = f"wc {random.choice(files)}"
+
+        elif action == "find":
+            dirs = _get_cwd_dirs(fs)
+            path = random.choice(dirs) if dirs and random.random() > 0.5 else "."
+            command = f"find {path}"
+
+        # === Pipes ===
+
         elif action == "pipe_grep":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
                 pattern = random.choice(["error", "test", "data", "info"])
                 command = f"cat {random.choice(files)} | grep {pattern}"
+
         elif action == "pipe_head":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
-                command = f"cat {random.choice(files)} | head"
+                if random.random() > 0.5:
+                    n = random.choice([3, 5, 10])
+                    command = f"cat {random.choice(files)} | head -n {n}"
+                else:
+                    command = f"cat {random.choice(files)} | head"
+
         elif action == "pipe_tail":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
-                command = f"cat {random.choice(files)} | tail"
+                if random.random() > 0.5:
+                    n = random.choice([3, 5, 10])
+                    command = f"cat {random.choice(files)} | tail -n {n}"
+                else:
+                    command = f"cat {random.choice(files)} | tail"
+
         elif action == "pipe_wc":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
+            files = _get_cwd_files(fs)
             if files:
                 command = f"cat {random.choice(files)} | wc"
-        elif action == "find":
-            dirs = [d for d in (fs.list_dir() or []) if fs.is_directory(d)]
-            path = random.choice(dirs) if dirs and random.random() > 0.5 else "."
-            command = f"find {path}"
+
+        elif action == "pipe_sort":
+            files = _get_cwd_files(fs)
+            if files:
+                command = f"cat {random.choice(files)} | sort"
+
+        elif action == "pipe_grep_wc":
+            files = _get_cwd_files(fs)
+            if files:
+                pattern = random.choice(["error", "test", "data", "info"])
+                command = f"cat {random.choice(files)} | grep {pattern} | wc"
+
+        # === Errors ===
+
         elif action == "error_no_file":
-            # Use a name unlikely to exist in the filesystem
             fake_file = "nonexistent_" + "".join(random.choices(string.ascii_lowercase, k=6))
-            cmd_choice = random.choice(["cat", "rm", "grep error", "head", "tail", "wc"])
-            command = f"{cmd_choice} {fake_file}"
+            cmd_choice = random.choice(["cat", "rm", "grep error", "head", "tail", "wc",
+                                        "mv", "cp"])
+            if cmd_choice in ("mv", "cp"):
+                command = f"{cmd_choice} {fake_file} {random_filename()}"
+            else:
+                command = f"{cmd_choice} {fake_file}"
+
         elif action == "error_wrong_type":
-            files = [f for f in (fs.list_dir() or []) if not fs.is_directory(f)]
-            dirs = [d for d in (fs.list_dir() or []) if fs.is_directory(d)]
+            files = _get_cwd_files(fs)
+            dirs = _get_cwd_dirs(fs)
             if files and random.random() > 0.5:
                 command = f"cd {random.choice(files)}"
             elif dirs:
                 command = f"cat {random.choice(dirs)}"
+
+        elif action == "unknown_command":
+            # Generate gibberish commands to train "command not found" errors
+            fake_cmd = "".join(random.choices(string.ascii_lowercase, k=random.randint(4, 10)))
+            command = fake_cmd
+
+        # === Execute and format ===
 
         if command:
             output, reasoning = executor.execute(command)
@@ -773,32 +1095,93 @@ def generate_conversation() -> str:
 
     return conversation_text
 
+
+# ============================================================================
+# DATASET GENERATION WITH SPLIT AND STATS
+# ============================================================================
+
+def compute_stats(conversations: List[str]) -> Dict:
+    """Compute dataset statistics."""
+    total_chars = sum(len(c) for c in conversations)
+    total_commands = 0
+    for c in conversations:
+        total_commands += c.count("### COMMAND ###")
+    return {
+        "num_conversations": len(conversations),
+        "total_commands": total_commands,
+        "avg_commands_per_conversation": total_commands / len(conversations) if conversations else 0,
+        "total_chars": total_chars,
+        "avg_chars_per_conversation": total_chars / len(conversations) if conversations else 0,
+    }
+
+
 def main():
     print(f"Generating {NUM_CONVERSATIONS} conversations with UNAMBIGUOUS format...")
     print(f"Commands per conversation: {COMMANDS_PER_CONVERSATION[0]}-{COMMANDS_PER_CONVERSATION[1]}")
     print(f"Output: {OUTPUT_FILE}")
     print()
 
+    conversations = []
+    for i in range(NUM_CONVERSATIONS):
+        if (i + 1) % 500 == 0:
+            print(f"Generated {i + 1}/{NUM_CONVERSATIONS} conversations...")
+        conversations.append(generate_conversation())
+
+    # Compute and print stats
+    stats = compute_stats(conversations)
+    print(f"\nDataset statistics:")
+    print(f"  Conversations:  {stats['num_conversations']:,}")
+    print(f"  Total commands: {stats['total_commands']:,}")
+    print(f"  Avg commands/conversation: {stats['avg_commands_per_conversation']:.1f}")
+    print(f"  Total chars:    {stats['total_chars']:,}")
+    print(f"  Avg chars/conversation:    {stats['avg_chars_per_conversation']:.0f}")
+
+    # Shuffle before splitting
+    random.shuffle(conversations)
+
+    # Split into train/val/test
+    total = len(conversations)
+    train_end = int(TRAIN_RATIO * total)
+    val_end = train_end + int(VAL_RATIO * total)
+
+    train_convs = conversations[:train_end]
+    val_convs = conversations[train_end:val_end]
+    test_convs = conversations[val_end:]
+
+    # Save full dataset (used by train.py)
+    print(f"\nSaving full dataset to {OUTPUT_FILE}...")
     with open(OUTPUT_FILE, "w") as f:
-        for i in range(NUM_CONVERSATIONS):
-            if (i + 1) % 500 == 0:
-                print(f"Generated {i + 1}/{NUM_CONVERSATIONS} conversations...")
+        for conv in conversations:
+            f.write(json.dumps({"text": conv}) + "\n")
 
-            conversation = generate_conversation()
-            # Save as single line JSON with text field
-            f.write(json.dumps({"text": conversation}) + "\n")
+    # Save splits
+    split_dir = Path("splits")
+    split_dir.mkdir(exist_ok=True)
 
-    print(f"\nDone! Generated {NUM_CONVERSATIONS} conversations")
-    print(f"Saved to: {OUTPUT_FILE}")
+    for name, split_convs in [("train", train_convs), ("val", val_convs), ("test", test_convs)]:
+        path = split_dir / f"laalm_v2_{name}.jsonl"
+        with open(path, "w") as f:
+            for conv in split_convs:
+                f.write(json.dumps({"text": conv}) + "\n")
+
+    print(f"\nSplit sizes:")
+    print(f"  Train: {len(train_convs):,} conversations ({len(train_convs)/total*100:.0f}%)")
+    print(f"  Val:   {len(val_convs):,} conversations ({len(val_convs)/total*100:.0f}%)")
+    print(f"  Test:  {len(test_convs):,} conversations ({len(test_convs)/total*100:.0f}%)")
+    print(f"\nFiles:")
+    print(f"  {OUTPUT_FILE} (full dataset)")
+    print(f"  splits/laalm_v2_train.jsonl")
+    print(f"  splits/laalm_v2_val.jsonl")
+    print(f"  splits/laalm_v2_test.jsonl")
 
     # Show example
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("EXAMPLE CONVERSATION FORMAT:")
-    print("="*60)
-    with open(OUTPUT_FILE) as f:
-        example = json.loads(f.readline())
-        print(example["text"][:800])
-        print("\n[... truncated ...]")
+    print("=" * 60)
+    example = json.loads(json.dumps({"text": conversations[0]}))
+    print(example["text"][:800])
+    print("\n[... truncated ...]")
+
 
 if __name__ == "__main__":
     main()
