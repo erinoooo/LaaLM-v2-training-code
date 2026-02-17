@@ -273,7 +273,7 @@ def train():
 
     if train_config.compile:
         print("\nCompiling model with torch.compile...")
-        model = torch.compile(model)
+        # model = torch.compile(model)
 
     # ---- Optimizer ----
     optimizer = configure_optimizer(model, train_config)
