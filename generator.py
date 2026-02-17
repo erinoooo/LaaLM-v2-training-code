@@ -26,8 +26,8 @@ from pathlib import Path
 # CONFIGURATION
 # ============================================================================
 
-NUM_CONVERSATIONS = 17500
-COMMANDS_PER_CONVERSATION = (30, 50)
+NUM_CONVERSATIONS = 75000
+COMMANDS_PER_CONVERSATION = (30, 60)
 OUTPUT_FILE = "laalm_v2_training_data_v3.jsonl"
 
 # Split ratios for train/val/test
