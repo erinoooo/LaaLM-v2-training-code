@@ -1,10 +1,13 @@
 """
-LaaLM-v2 Interactive Inference - FIXED VERSION
+LaaLM-v2 Interactive Inference (TPU)
 Uses v3 delimiter format matching training data
 """
 
 import torch
 from tokenizers import Tokenizer
+
+import torch_xla
+import torch_xla.core.xla_model as xm
 
 from model import LaaLMv2Config, LaaLMModel
 
@@ -13,20 +16,21 @@ from model import LaaLMv2Config, LaaLMModel
 # ============================================================================
 
 class LaaLMTerminal:
-    def __init__(self, checkpoint_path, tokenizer_path, device="cuda"):
-        self.device = device
+    def __init__(self, checkpoint_path, tokenizer_path, device=None):
+        self.device = device if device is not None else xm.xla_device()
         print("Loading tokenizer...")
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
 
         print("Loading model...")
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        # Load checkpoint to CPU first, then move to TPU
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         config = checkpoint['config']
 
         self.model = LaaLMModel(config)
         state_dict = checkpoint['model_state_dict']
         cleaned_state = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
         self.model.load_state_dict(cleaned_state)
-        self.model = self.model.to(device).eval()
+        self.model = self.model.to(torch.bfloat16).to(self.device).eval()
 
         print(f"Model loaded: {config.n_params/1e6:.1f}M parameters")
 
@@ -134,7 +138,7 @@ def main():
     terminal = LaaLMTerminal(
         checkpoint_path=checkpoint_path,
         tokenizer_path="laalm_v2_tokenizer_v3.json",
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=xm.xla_device(),
     )
 
     print()

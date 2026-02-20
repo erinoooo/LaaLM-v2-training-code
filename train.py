@@ -1,5 +1,5 @@
 """
-LaaLM-v2 Training Script — Optimized for Maximum Model Quality
+LaaLM-v2 Training Script — Optimized for Maximum Model Quality (TPU)
 
 Key improvements over naive training:
   1. Pre-tokenized concatenated data — zero padding waste, uses 99%+ of all
@@ -13,6 +13,8 @@ Key improvements over naive training:
   6. Scaled residual initialization — stable training for deep networks
   7. Cosine schedule with lower min_lr — more refined final training
   8. Gradient norm logging — detect instability early
+
+TPU backend: Uses PyTorch/XLA for Google Cloud TPU acceleration.
 """
 
 import torch
@@ -27,6 +29,10 @@ from pathlib import Path
 from tqdm import tqdm
 import wandb
 from dataclasses import dataclass
+
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
 
 from model import LaaLMv2Config, LaaLMModel
 
@@ -58,10 +64,12 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
 
-    # System
-    device: str = "cuda"
-    dtype: torch.dtype = torch.bfloat16
-    compile: bool = True
+    # System — TPU via PyTorch/XLA
+    # device is set dynamically via xm.xla_device(); this field is kept for
+    # compatibility but overridden in train()
+    device: str = "xla"
+    dtype: torch.dtype = torch.bfloat16  # TPU natively supports bfloat16
+    compile: bool = False  # torch.compile with XLA backend; disabled by default
 
     # Checkpointing
     output_dir: str = "checkpoints_v2"
@@ -188,8 +196,9 @@ def evaluate(model, val_loader, config):
     for x, y in val_loader:
         x = x.to(config.device)
         y = y.to(config.device)
-        with torch.autocast(device_type='cuda', dtype=config.dtype):
-            _, loss = model(x, y)
+        # Model is already in bfloat16 on TPU — no autocast needed since
+        # TPU natively operates in bfloat16
+        _, loss = model(x, y)
         total_loss += loss.item()
         n_batches += 1
 
@@ -204,8 +213,13 @@ def train():
     model_config = LaaLMv2Config()
     train_config = TrainConfig()
 
+    # ---- TPU device setup ----
+    device = xm.xla_device()
+    train_config.device = device
+    print(f"Using TPU device: {device}")
+
     print("=" * 60)
-    print("LaaLM-v2 Training — Quality Optimized")
+    print("LaaLM-v2 Training — Quality Optimized (TPU)")
     print("=" * 60)
     print(f"\nModel: {model_config.n_params/1e6:.1f}M parameters")
     print(f"  d_model={model_config.d_model}, n_layers={model_config.n_layers}, "
@@ -255,25 +269,28 @@ def train():
         train_dataset,
         batch_size=train_config.batch_size,
         shuffle=True,
-        pin_memory=True,
         drop_last=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_config.batch_size,
         shuffle=False,
-        pin_memory=True,
     )
+
+    # Wrap DataLoaders with MpDeviceLoader for efficient host-to-TPU transfer
+    train_device_loader = pl.MpDeviceLoader(train_loader, device)
+    val_device_loader = pl.MpDeviceLoader(val_loader, device)
+
     print(f"\n  Train chunks: {len(train_dataset):,}")
     print(f"  Val chunks:   {len(val_dataset):,}")
 
     # ---- Model ----
     model = LaaLMModel(model_config)
-    model = model.to(train_config.device).to(train_config.dtype)
+    model = model.to(train_config.dtype).to(device)
 
     if train_config.compile:
-        print("\nCompiling model with torch.compile...")
-        # model = torch.compile(model)
+        print("\nCompiling model with torch.compile (openxla backend)...")
+        model = torch.compile(model, backend='openxla')
 
     # ---- Optimizer ----
     optimizer = configure_optimizer(model, train_config)
@@ -287,10 +304,10 @@ def train():
     tokens_processed = 0
 
     Path(train_config.output_dir).mkdir(exist_ok=True)
-    train_iter = iter(train_loader)
+    train_iter = iter(train_device_loader)
 
     # ---- Initial validation ----
-    val_loss = evaluate(model, val_loader, train_config)
+    val_loss = evaluate(model, val_device_loader, train_config)
     val_ppl = math.exp(min(val_loss, 20))
     print(f"\nInitial val loss: {val_loss:.4f} (ppl: {val_ppl:.2f})")
     wandb.log({"val/loss": val_loss, "val/perplexity": val_ppl, "step": 0})
@@ -302,19 +319,17 @@ def train():
 
     while optimizer_step < train_config.max_steps:
         # Get batch (cycle through epochs)
+        # MpDeviceLoader handles host-to-device transfer automatically
         try:
             x, y = next(train_iter)
         except StopIteration:
-            train_iter = iter(train_loader)
+            train_iter = iter(train_device_loader)
             x, y = next(train_iter)
 
-        x = x.to(train_config.device)
-        y = y.to(train_config.device)
-
         # Forward + backward (micro-step)
-        with torch.autocast(device_type='cuda', dtype=train_config.dtype):
-            _, loss = model(x, y)
-            scaled_loss = loss / train_config.gradient_accumulation_steps
+        # Model is already in bfloat16 on TPU — no autocast needed
+        _, loss = model(x, y)
+        scaled_loss = loss / train_config.gradient_accumulation_steps
 
         scaled_loss.backward()
         running_loss += scaled_loss.item()
@@ -324,6 +339,7 @@ def train():
         # ---- Optimizer step (every gradient_accumulation_steps micro-steps) ----
         if micro_step % train_config.gradient_accumulation_steps == 0:
             # Clip gradients
+            xm.reduce_gradients(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), train_config.grad_clip
             )
@@ -333,8 +349,9 @@ def train():
             for pg in optimizer.param_groups:
                 pg['lr'] = lr
 
-            # Step
-            optimizer.step()
+            # Step — xm.optimizer_step includes xm.mark_step() to flush
+            # the XLA computation graph
+            xm.optimizer_step(optimizer)
             optimizer.zero_grad(set_to_none=True)
 
             # ---- Logging ----
@@ -357,7 +374,7 @@ def train():
 
             # ---- Validation ----
             if optimizer_step > 0 and optimizer_step % train_config.eval_interval == 0:
-                val_loss = evaluate(model, val_loader, train_config)
+                val_loss = evaluate(model, val_device_loader, train_config)
                 val_ppl = math.exp(min(val_loss, 20))
                 wandb.log({
                     "val/loss": val_loss,
@@ -369,9 +386,11 @@ def train():
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_path = f"{train_config.output_dir}/laalm_v2_best.pt"
-                    torch.save({
+                    # Move state dict to CPU for portable checkpoints
+                    cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                    xm.save({
                         'optimizer_step': optimizer_step,
-                        'model_state_dict': model.state_dict(),
+                        'model_state_dict': cpu_state,
                         'config': model_config,
                         'val_loss': val_loss,
                     }, best_path)
@@ -385,10 +404,16 @@ def train():
             # ---- Checkpoint ----
             if optimizer_step > 0 and optimizer_step % train_config.save_interval == 0:
                 ckpt_path = f"{train_config.output_dir}/checkpoint_{optimizer_step}.pt"
-                torch.save({
+                cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                cpu_opt_state = {
+                    k: {sk: sv.cpu() if torch.is_tensor(sv) else sv
+                        for sk, sv in v.items()} if isinstance(v, dict) else v
+                    for k, v in optimizer.state_dict().items()
+                }
+                xm.save({
                     'optimizer_step': optimizer_step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
+                    'model_state_dict': cpu_state,
+                    'optimizer_state_dict': cpu_opt_state,
                     'config': model_config,
                     'best_val_loss': best_val_loss,
                 }, ckpt_path)
@@ -401,13 +426,14 @@ def train():
 
     # ---- Final save & eval ----
     final_path = f"{train_config.output_dir}/laalm_v2_final.pt"
-    torch.save({
-        'model_state_dict': model.state_dict(),
+    cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
+    xm.save({
+        'model_state_dict': cpu_state,
         'config': model_config,
         'best_val_loss': best_val_loss,
     }, final_path)
 
-    final_val = evaluate(model, val_loader, train_config)
+    final_val = evaluate(model, val_device_loader, train_config)
     final_ppl = math.exp(min(final_val, 20))
 
     print()
