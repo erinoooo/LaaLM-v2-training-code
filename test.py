@@ -6,8 +6,24 @@ Uses v3 delimiter format matching training data
 import torch
 from tokenizers import Tokenizer
 
-import torch_xla
-import torch_xla.core.xla_model as xm
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+except ImportError as e:
+    _msg = str(e)
+    if "undefined symbol" in _msg or "_XLAC" in _msg:
+        raise SystemExit(
+            "\n[ERROR] torch_xla version mismatch with torch.\n"
+            "torch and torch_xla must be exactly the same version.\n\n"
+            "Fix — run these commands in your venv:\n"
+            "  pip show torch               # note the version (e.g. 2.5.1)\n"
+            "  pip uninstall torch_xla -y\n"
+            "  pip install torch_xla==<same-version-as-torch>\n\n"
+            "Or reinstall both together:\n"
+            "  pip install torch==2.5.1 torch_xla==2.5.0\n\n"
+            f"Original error: {_msg}"
+        ) from None
+    raise
 
 from model import LaaLMv2Config, LaaLMModel
 

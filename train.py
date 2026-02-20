@@ -30,9 +30,27 @@ from tqdm import tqdm
 import wandb
 from dataclasses import dataclass
 
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+except ImportError as e:
+    _msg = str(e)
+    if "undefined symbol" in _msg or "_XLAC" in _msg:
+        raise SystemExit(
+            "\n[ERROR] torch_xla version mismatch with torch.\n"
+            "torch and torch_xla must be exactly the same version.\n\n"
+            "Fix — run these commands in your venv:\n"
+            "  pip show torch               # note the version (e.g. 2.5.1)\n"
+            "  pip uninstall torch_xla -y\n"
+            "  pip install torch_xla==<same-version-as-torch>\n\n"
+            "Or reinstall both together:\n"
+            "  pip install torch==2.5.1 torch_xla==2.5.0\n\n"
+            "On a Google Cloud TPU VM, use the pre-installed environment\n"
+            "or follow: https://pytorch.org/xla/release/r2.5/index.html\n\n"
+            f"Original error: {_msg}"
+        ) from None
+    raise
 
 from model import LaaLMv2Config, LaaLMModel
 
@@ -118,6 +136,7 @@ class LaaLMDataset(Dataset):
         all_tokens = all_tokens[:usable]
 
         self.data = torch.tensor(all_tokens, dtype=torch.long).view(n_chunks, max_len + 1)
+        del all_tokens  # free the large Python list immediately; tensor owns the data now
 
         print(f"  Conversations: {n_convs:,}")
         print(f"  Total tokens:  {total_tokens:,}")
@@ -188,22 +207,28 @@ def configure_optimizer(model, config):
 
 @torch.no_grad()
 def evaluate(model, val_loader, config):
-    """Evaluate model on validation set. Returns average loss."""
+    """Evaluate model on validation set. Returns average loss.
+
+    Accumulates loss as an XLA scalar tensor across all val batches so that
+    only ONE device sync (.item()) happens at the end, instead of one per
+    batch.  MpDeviceLoader already places tensors on the device so we skip
+    the redundant .to() calls.
+    """
     model.eval()
-    total_loss = 0.0
+    total_loss_xla = torch.zeros((), device=config.device, dtype=torch.float32)
     n_batches = 0
 
     for x, y in val_loader:
-        x = x.to(config.device)
-        y = y.to(config.device)
-        # Model is already in bfloat16 on TPU — no autocast needed since
-        # TPU natively operates in bfloat16
         _, loss = model(x, y)
-        total_loss += loss.item()
+        total_loss_xla = total_loss_xla + loss.detach().float()
         n_batches += 1
 
+    # Single graph flush for the whole validation pass
+    xm.mark_step()
+    result = (total_loss_xla / max(n_batches, 1)).item()
+
     model.train()
-    return total_loss / max(n_batches, 1)
+    return result
 
 # ============================================================================
 # TRAINING LOOP
@@ -265,16 +290,24 @@ def train():
             generator=torch.Generator().manual_seed(42),
         )
 
+    # num_workers > 0 lets the host prefetch data on background threads so
+    # the TPU never idles waiting for the next batch.
+    # persistent_workers keeps the worker processes alive across epochs,
+    # avoiding re-spawn overhead at every StopIteration.
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_config.batch_size,
         shuffle=True,
         drop_last=True,
+        num_workers=4,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_config.batch_size,
         shuffle=False,
+        num_workers=4,
+        persistent_workers=True,
     )
 
     # Wrap DataLoaders with MpDeviceLoader for efficient host-to-TPU transfer
@@ -302,6 +335,9 @@ def train():
     running_loss = 0.0
     best_val_loss = float('inf')
     tokens_processed = 0
+    # XLA scalar for deferred loss accumulation — stays on device until after
+    # xm.optimizer_step() to avoid splitting the compiled graph prematurely
+    step_loss_xla = torch.zeros((), device=device, dtype=torch.float32)
 
     Path(train_config.output_dir).mkdir(exist_ok=True)
     train_iter = iter(train_device_loader)
@@ -331,15 +367,21 @@ def train():
         _, loss = model(x, y)
         scaled_loss = loss / train_config.gradient_accumulation_steps
 
+        # Accumulate loss on the XLA device — do NOT call .item() here.
+        # Calling .item() before xm.optimizer_step() forces an early graph
+        # flush, splitting the forward+backward graph from the optimizer graph.
+        # That doubles peak TPU RAM usage and causes two graph compilations
+        # per step instead of one.
+        step_loss_xla = step_loss_xla + scaled_loss.detach().float()
         scaled_loss.backward()
-        running_loss += scaled_loss.item()
         micro_step += 1
         tokens_processed += x.numel()
 
         # ---- Optimizer step (every gradient_accumulation_steps micro-steps) ----
         if micro_step % train_config.gradient_accumulation_steps == 0:
-            # Clip gradients
-            xm.reduce_gradients(optimizer)
+            # Clip gradients.
+            # xm.reduce_gradients() is a distributed allreduce — omit on
+            # single-device training to avoid unnecessary communication overhead.
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), train_config.grad_clip
             )
@@ -349,13 +391,17 @@ def train():
             for pg in optimizer.param_groups:
                 pg['lr'] = lr
 
-            # Step — xm.optimizer_step includes xm.mark_step() to flush
-            # the XLA computation graph
+            # xm.optimizer_step flushes the entire accumulated XLA graph
+            # (forward + backward + optimizer updates) in one compiled kernel.
             xm.optimizer_step(optimizer)
             optimizer.zero_grad(set_to_none=True)
 
             # ---- Logging ----
-            avg_loss = running_loss
+            # Read loss AFTER the graph flush — step_loss_xla is now a
+            # materialized scalar; no live activations remain in TPU RAM.
+            avg_loss = step_loss_xla.item()
+            step_loss_xla = torch.zeros((), device=device, dtype=torch.float32)
+            running_loss = avg_loss
             dt = time.time() - t0
             tps = tokens_processed / dt if dt > 0 else 0
 
@@ -370,7 +416,6 @@ def train():
             pbar.set_description(
                 f"loss={avg_loss:.4f} lr={lr:.1e} tps={tps:.0f}"
             )
-            running_loss = 0.0
 
             # ---- Validation ----
             if optimizer_step > 0 and optimizer_step % train_config.eval_interval == 0:
