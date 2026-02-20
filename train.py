@@ -67,8 +67,11 @@ class TrainConfig:
     val_split_ratio: float = 0.05  # Fallback if val file doesn't exist
 
     # Training — all step counts are OPTIMIZER steps (not micro-batches)
-    batch_size: int = 128
-    gradient_accumulation_steps: int = 1
+    # batch_size=8 keeps each micro-step's activation graph under ~10 GB so
+    # the XLA compiler can compile it on a 30 GB TPU chip.
+    # gradient_accumulation_steps=16 recovers the effective batch of 128.
+    batch_size: int = 8
+    gradient_accumulation_steps: int = 16
     max_steps: int = 50000   # 50K optimizer steps
     warmup_steps: int = 3000
     eval_interval: int = 500
@@ -368,14 +371,21 @@ def train():
         scaled_loss = loss / train_config.gradient_accumulation_steps
 
         # Accumulate loss on the XLA device — do NOT call .item() here.
-        # Calling .item() before xm.optimizer_step() forces an early graph
-        # flush, splitting the forward+backward graph from the optimizer graph.
-        # That doubles peak TPU RAM usage and causes two graph compilations
-        # per step instead of one.
         step_loss_xla = step_loss_xla + scaled_loss.detach().float()
         scaled_loss.backward()
         micro_step += 1
         tokens_processed += x.numel()
+
+        # Between gradient accumulation micro-steps (but NOT before the
+        # optimizer step), flush the XLA graph so activations from this
+        # micro-step are freed before the next one is traced.  Without this,
+        # XLA lazily accumulates ALL micro-step graphs into one giant graph
+        # (gradient_accumulation_steps × the per-step graph size), which
+        # multiplies the compilation memory requirement by the accumulation
+        # factor.  Gradients are tensors on the device and survive mark_step.
+        is_last_micro_step = (micro_step % train_config.gradient_accumulation_steps == 0)
+        if not is_last_micro_step:
+            xm.mark_step()
 
         # ---- Optimizer step (every gradient_accumulation_steps micro-steps) ----
         if micro_step % train_config.gradient_accumulation_steps == 0:

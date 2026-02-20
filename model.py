@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 
 # ============================================================================
@@ -30,6 +31,10 @@ class LaaLMConfig:
     max_seq_len: int
     dropout: float = 0.1
     use_swiglu: bool = False
+    # Recompute layer activations during backward instead of storing all
+    # n_layers worth simultaneously.  Cuts activation memory from
+    # O(n_layers) to O(1) at the cost of one extra forward pass per layer.
+    use_gradient_checkpointing: bool = False
 
     def __post_init__(self):
         """Validate configuration and compute derived values."""
@@ -80,6 +85,7 @@ class LaaLMv2Config(LaaLMConfig):
     max_seq_len: int = 1024
     dropout: float = 0.05
     use_swiglu: bool = True
+    use_gradient_checkpointing: bool = True  # required to fit 20 layers on 30 GB TPU
 
 
 # ============================================================================
@@ -280,7 +286,13 @@ class LaaLMModel(nn.Module):
 
         # Transformer blocks
         for block in self.blocks:
-            x = block(x)
+            if self.config.use_gradient_checkpointing and self.training:
+                # use_reentrant=False is the recommended API for XLA/TPU:
+                # it doesn't rely on Python re-entrancy and traces correctly
+                # under XLA's lazy evaluation model.
+                x = gradient_checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         # Final norm and projection
         x = self.norm_f(x)
