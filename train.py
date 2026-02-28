@@ -1,67 +1,56 @@
 """
-LaaLM-v2 Training Script — Optimized for Maximum Model Quality (TPU)
+LaaLM-v2 Training Script — Migrated from TPU/XLA to NVIDIA L40S with FP8
 
-Key improvements over naive training:
-  1. Pre-tokenized concatenated data — zero padding waste, uses 99%+ of all
-     tokens instead of truncating 80%+ of each conversation
-  2. Validation evaluation loop — tracks val loss, saves best model checkpoint
-  3. Optimizer-step counting — max_steps/warmup/save/eval all count actual
-     optimizer updates, not micro-batches
-  4. Proper weight decay groups — 2D params (matrices) get decay, 1D params
-     (norms, biases) do not
-  5. SwiGLU architecture — same param count, better quality
-  6. Scaled residual initialization — stable training for deep networks
-  7. Cosine schedule with lower min_lr — more refined final training
-  8. Gradient norm logging — detect instability early
-  9. Multi-chip data parallelism — all TPU chips train in parallel via
-     xmp.spawn + DistributedSampler + xm.reduce_gradients
+Backend changes from original (TPU/XLA → CUDA/L40S):
+  - torch_xla / xmp.spawn      → torch.distributed (NCCL) + torchrun
+  - xm.xla_device()            → torch.device("cuda:<rank>")
+  - xm.optimizer_step()        → optimizer.step() (standard)
+  - xm.reduce_gradients()      → DDP handles allreduce automatically
+  - xm.mesh_reduce()           → dist.all_reduce (explicit collectives)
+  - pl.MpDeviceLoader          → standard DataLoader (tensors go to CUDA)
+  - xm.save()                  → torch.save()
+  - xm.mark_step()             → removed (XLA graph flushing not needed)
+  - model.no_sync()            → used during gradient accumulation micro-steps
+                                  to suppress redundant DDP allreduce
 
-TPU backend: Uses PyTorch/XLA for Google Cloud TPU acceleration.
-Multi-chip:  xmp.spawn launches one worker process per chip.  Each worker
-             owns one chip, sees a unique data shard (DistributedSampler),
-             and gradients are averaged across chips via xm.reduce_gradients
-             before every optimizer update.
+FP8 changes (new):
+  - te.fp8_autocast()          → wraps the forward pass; activates FP8 Tensor
+                                  Core ops in all te.Linear / te.RMSNorm layers
+  - DelayedScaling recipe      → per-tensor scale factors updated every step
+                                  using a history of amax values (standard for
+                                  FP8 training stability)
+  - dtype stays bfloat16       → model weights + optimizer states in BF16;
+                                  only the matmul inputs/outputs go through FP8
+
+Usage:
+  Single GPU:
+    python train.py
+
+  Multi-GPU (e.g. 4× L40S):
+    torchrun --nproc_per_node=4 train.py
 """
 
 import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from tokenizers import Tokenizer
-import json
 import math
 import time
+import json
 from pathlib import Path
-from tqdm import tqdm
-import wandb
 from dataclasses import dataclass
 
-try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    import torch_xla.runtime as xr
-except ImportError as e:
-    _msg = str(e)
-    if "undefined symbol" in _msg or "_XLAC" in _msg:
-        raise SystemExit(
-            "\n[ERROR] torch_xla version mismatch with torch.\n"
-            "torch and torch_xla must be exactly the same version.\n\n"
-            "Fix — run these commands in your venv:\n"
-            "  pip show torch               # note the version (e.g. 2.5.1)\n"
-            "  pip uninstall torch_xla -y\n"
-            "  pip install torch_xla==<same-version-as-torch>\n\n"
-            "Or reinstall both together:\n"
-            "  pip install torch==2.5.1 torch_xla==2.5.0\n\n"
-            "On a Google Cloud TPU VM, use the pre-installed environment\n"
-            "or follow: https://pytorch.org/xla/release/r2.5/index.html\n\n"
-            f"Original error: {_msg}"
-        ) from None
-    raise
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from tqdm import tqdm
+import wandb
+from tokenizers import Tokenizer
+
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, DelayedScaling
 
 from model import LaaLMv2Config, LaaLMModel
+
 
 # ============================================================================
 # CONFIG
@@ -73,55 +62,45 @@ class TrainConfig:
     data_path: str = "laalm_v2_training_data_v3.jsonl"
     val_data_path: str = "splits/laalm_v2_val.jsonl"
     tokenizer_path: str = "laalm_v2_tokenizer_v3.json"
-    val_split_ratio: float = 0.05  # Fallback if val file doesn't exist
+    val_split_ratio: float = 0.05
 
-    # Training — all step counts are OPTIMIZER steps (not micro-batches)
-    # batch=32 × accum=4 × world_size chips = effective global batch.
-    # Per-chip attention score tensor stays at [32,4,1024,1024] = 256 MB (bf16)
-    # regardless of world_size — memory footprint per chip is unchanged.
+    # Training
     batch_size: int = 32
     gradient_accumulation_steps: int = 4
-    max_steps: int = 50000   # 50K optimizer steps
+    max_steps: int = 50000
     warmup_steps: int = 3000
     eval_interval: int = 500
     save_interval: int = 2000
 
     # Optimizer
     learning_rate: float = 2e-4
-    min_lr_ratio: float = 0.01  # Minimum LR = learning_rate * 0.01
+    min_lr_ratio: float = 0.01
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
 
-    # System — TPU via PyTorch/XLA
-    # device is set dynamically via xm.xla_device(); this field is kept for
-    # compatibility but overridden in train()
-    device: str = "xla"
-    dtype: torch.dtype = torch.bfloat16  # TPU natively supports bfloat16
-    compile: bool = False  # torch.compile with XLA backend; disabled by default
+    # System
+    dtype: torch.dtype = torch.bfloat16  # L40S has good BF16 support; FP8 is applied on top
+    num_workers: int = 4                 # CPU workers for DataLoader prefetch (unlike TPU, safe here)
+    compile: bool = False                # torch.compile — optional, can help on CUDA
+
+    # FP8 recipe (DelayedScaling)
+    fp8_amax_history_len: int = 16       # how many steps to track tensor amax history
+    fp8_amax_compute_algo: str = "max"   # "max" or "most_recent"
 
     # Checkpointing
     output_dir: str = "checkpoints_v2"
     wandb_project: str = "laalm-v2"
-    wandb_run_name: str = "laalm-v2-quality"
+    wandb_run_name: str = "laalm-v2-l40s-fp8"
+
 
 # ============================================================================
-# DATASET — PRE-TOKENIZED & CONCATENATED
+# DATASET — unchanged from original
 # ============================================================================
 
 class LaaLMDataset(Dataset):
-    """Pre-tokenized, concatenated dataset for maximum data utilization.
-
-    Instead of truncating each conversation to max_len (throwing away 80%+
-    of long conversations) and padding short ones (wasting compute on pad
-    tokens), this:
-      1. Tokenizes all conversations
-      2. Concatenates them with EOS separators
-      3. Splits the stream into fixed-size chunks
-
-    Result: zero padding, zero waste, 99%+ token utilization.
-    """
+    """Pre-tokenized, concatenated dataset. Unchanged from original."""
 
     def __init__(self, data_path, tokenizer, max_len=8192, verbose=True):
         self.max_len = max_len
@@ -142,14 +121,12 @@ class LaaLMDataset(Dataset):
                 n_convs += 1
 
         total_tokens = len(all_tokens)
-
-        # Each chunk needs max_len+1 tokens (for the input/target shift)
         n_chunks = total_tokens // (max_len + 1)
         usable = n_chunks * (max_len + 1)
         all_tokens = all_tokens[:usable]
 
         self.data = torch.tensor(all_tokens, dtype=torch.long).view(n_chunks, max_len + 1)
-        del all_tokens  # free the large Python list immediately; tensor owns the data now
+        del all_tokens
 
         if verbose:
             print(f"  Conversations: {n_convs:,}")
@@ -162,39 +139,38 @@ class LaaLMDataset(Dataset):
 
     def __getitem__(self, idx):
         chunk = self.data[idx]
-        return chunk[:-1], chunk[1:]  # (input, target)
+        return chunk[:-1], chunk[1:]
+
 
 # ============================================================================
-# LEARNING RATE SCHEDULE
+# LEARNING RATE SCHEDULE — unchanged
 # ============================================================================
 
 def get_lr(optimizer_step, config):
     """Cosine annealing with linear warmup."""
     min_lr = config.learning_rate * config.min_lr_ratio
-
     if optimizer_step < config.warmup_steps:
         return config.learning_rate * optimizer_step / config.warmup_steps
     if optimizer_step > config.max_steps:
         return min_lr
-
     progress = (optimizer_step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
     coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr + coeff * (config.learning_rate - min_lr)
 
+
 # ============================================================================
-# OPTIMIZER WITH PROPER WEIGHT DECAY
+# OPTIMIZER — unchanged logic, but no XLA-specific handling needed
 # ============================================================================
 
 def configure_optimizer(model, config, is_master=True):
-    """Create AdamW with proper weight decay groups.
-
-    2D parameters (weight matrices) get weight decay.
-    1D parameters (norms, biases, embeddings) do not.
-    """
+    """AdamW with weight decay on 2D params only."""
     decay_params = []
     no_decay_params = []
 
-    for name, param in model.named_parameters():
+    # If DDP-wrapped, access the underlying module for named_parameters
+    raw_model = model.module if isinstance(model, DDP) else model
+
+    for name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
         if param.dim() >= 2:
@@ -216,116 +192,129 @@ def configure_optimizer(model, config, is_master=True):
         betas=(config.beta1, config.beta2),
     )
 
+
+# ============================================================================
+# DISTRIBUTED HELPERS
+# ============================================================================
+
+def all_reduce_mean(tensor: torch.Tensor) -> float:
+    """Average a scalar tensor across all ranks. Returns Python float."""
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return (tensor / dist.get_world_size()).item()
+
+
 # ============================================================================
 # VALIDATION
 # ============================================================================
 
 @torch.no_grad()
-def evaluate(model, val_loader, config):
-    """Evaluate model on validation set. Returns average loss.
+def evaluate(model, val_loader, device, fp8_recipe):
+    """Evaluate on validation set. Returns global average loss across all ranks.
 
-    Accumulates loss as an XLA scalar tensor across all val batches so that
-    only ONE device sync (.item()) happens at the end, instead of one per
-    batch.  MpDeviceLoader already places tensors on the device so we skip
-    the redundant .to() calls.
-
-    In multi-chip mode, each chip evaluates its own data shard and the
-    results are aggregated via xm.mesh_reduce (a collective called by all
-    processes simultaneously) before returning the global average.
+    FP8 note: we also wrap validation in fp8_autocast so the same FP8 weights
+    are used — this gives accurate validation numbers that match train behavior.
     """
-    model.eval()
-    total_loss_xla = torch.zeros((), device=config.device, dtype=torch.float32)
+    raw_model = model.module if isinstance(model, DDP) else model
+    raw_model.eval()
+
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
     n_batches = 0
 
     for x, y in val_loader:
-        _, loss = model(x, y)
-        total_loss_xla = total_loss_xla + loss.detach().float()
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            _, loss = raw_model(x, y)
+        total_loss += loss.detach().float()
         n_batches += 1
 
-    # Single graph flush for the whole validation pass
-    xm.mark_step()
-    local_loss = total_loss_xla.item()
+    # Reduce across ranks to get global average loss
+    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+    n_batches_tensor = torch.tensor(n_batches, device=device, dtype=torch.float32)
+    dist.all_reduce(n_batches_tensor, op=dist.ReduceOp.SUM)
 
-    # Aggregate loss and batch count across all chips.
-    # mesh_reduce is a collective — every process calls it simultaneously.
-    # On a single chip it is a no-op (sum of one value).
-    global_loss = xm.mesh_reduce('val_loss', local_loss, sum)
-    global_n = xm.mesh_reduce('val_n_batches', float(n_batches), sum)
-    result = global_loss / max(global_n, 1)
+    raw_model.train()
+    return (total_loss / n_batches_tensor.clamp(min=1)).item()
 
-    model.train()
-    return result
 
 # ============================================================================
-# TRAINING LOOP
+# TRAINING
 # ============================================================================
 
-def train(index):
-    """Training worker — one instance runs on each TPU chip via xmp.spawn.
+def train():
+    # ---- Distributed setup ----
+    # torchrun sets LOCAL_RANK, RANK, WORLD_SIZE automatically.
+    # For single-GPU, these default to 0 / 0 / 1 via the fallback below.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    Args:
-        index: Chip ordinal (0..world_size-1), injected automatically by
-               xmp.spawn.
-    """
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
+    else:
+        # Single-GPU: create a trivial process group so dist.all_reduce still works
+        dist.init_process_group(backend="nccl", init_method="tcp://127.0.0.1:29500",
+                                world_size=1, rank=0)
+
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    is_master = (rank == 0)
+
     model_config = LaaLMv2Config()
     train_config = TrainConfig()
 
-    # ---- TPU device & distributed setup ----
-    device = xm.xla_device()
-    train_config.device = device
-    world_size = xr.world_size()
-    rank = xr.global_ordinal()
-    is_master = (rank == 0)
+    # ---- FP8 recipe ----
+    # DelayedScaling: reuses per-tensor scale factors from the previous step,
+    # recomputes them every `interval` steps using a rolling amax history.
+    # HYBRID format: E4M3 in forward pass (more precision), E5M2 in backward
+    # (more dynamic range for gradients).
+    fp8_recipe = DelayedScaling(
+        fp8_format=Format.HYBRID,
+        amax_history_len=train_config.fp8_amax_history_len,
+        amax_compute_algo=train_config.fp8_amax_compute_algo,
+    )
 
-    if is_master:
-        print(f"Distributed setup: {world_size} TPU chip(s) — rank {rank} on {device}")
-
-    if is_master:
-        print("=" * 60)
-        print("LaaLM-v2 Training — Quality Optimized (TPU)")
-        print("=" * 60)
-        print(f"\nModel: {model_config.n_params/1e6:.1f}M parameters")
-        print(f"  d_model={model_config.d_model}, n_layers={model_config.n_layers}, "
-              f"n_heads={model_config.n_heads}, d_ff={model_config.d_ff}")
-        print(f"  max_seq_len={model_config.max_seq_len}, "
-              f"swiglu={'yes' if model_config.use_swiglu else 'no'}, "
-              f"dropout={model_config.dropout}")
-
-    # Effective batch scales linearly with the number of chips.
     eff_batch = train_config.batch_size * train_config.gradient_accumulation_steps * world_size
     tokens_per_step = eff_batch * model_config.max_seq_len
 
     if is_master:
+        print("=" * 60)
+        print("LaaLM-v2 Training — NVIDIA L40S + FP8")
+        print("=" * 60)
+        print(f"\nModel: {model_config.n_params/1e6:.1f}M parameters")
+        print(f"  d_model={model_config.d_model}, n_layers={model_config.n_layers}, "
+              f"n_heads={model_config.n_heads}, d_ff={model_config.d_ff}")
+        print(f"  max_seq_len={model_config.max_seq_len}, swiglu={'yes' if model_config.use_swiglu else 'no'}")
+        print(f"\nDistributed: {world_size} GPU(s), rank {rank}")
+        print(f"FP8 recipe: HYBRID, amax_history={train_config.fp8_amax_history_len}")
         print(f"\nTraining:")
-        print(f"  Chips:           {world_size}")
-        print(f"  Per-chip batch:  {train_config.batch_size} x {train_config.gradient_accumulation_steps} accum")
-        print(f"  Effective batch: {eff_batch} (per-chip × {world_size} chips)")
+        print(f"  Per-GPU batch:   {train_config.batch_size} x {train_config.gradient_accumulation_steps} accum")
+        print(f"  Effective batch: {eff_batch}")
         print(f"  Tokens/step:     {tokens_per_step:,}")
         print(f"  Optimizer steps: {train_config.max_steps:,}")
-        print(f"  Warmup:          {train_config.warmup_steps:,} steps")
         print(f"  LR:              {train_config.learning_rate} -> "
               f"{train_config.learning_rate * train_config.min_lr_ratio}")
         print()
 
-    # ---- Wandb (master only) ----
+    # ---- Wandb ----
     if is_master:
-        wandb_config = {**model_config.__dict__, **train_config.__dict__}
-        wandb_config['dtype'] = str(train_config.dtype)
-        wandb_config['effective_batch_size'] = eff_batch
-        wandb_config['tokens_per_step'] = tokens_per_step
-        wandb_config['world_size'] = world_size
         wandb.init(
             project=train_config.wandb_project,
             name=train_config.wandb_run_name,
-            config=wandb_config,
+            config={
+                **model_config.__dict__,
+                **{k: str(v) if isinstance(v, torch.dtype) else v
+                   for k, v in train_config.__dict__.items()},
+                'effective_batch_size': eff_batch,
+                'tokens_per_step': tokens_per_step,
+                'world_size': world_size,
+                'fp8': True,
+            },
             mode="disabled",
         )
 
     # ---- Data ----
     tokenizer = Tokenizer.from_file(train_config.tokenizer_path)
 
-    # Each chip loads its own copy of the dataset (independent I/O).
-    # Only the master chip prints progress to avoid 4× duplicate output.
     if Path(train_config.val_data_path).exists():
         if is_master:
             print("Using existing validation split")
@@ -351,9 +340,6 @@ def train(index):
             generator=torch.Generator().manual_seed(42),
         )
 
-    # DistributedSampler gives each chip a non-overlapping shard of the data.
-    # set_epoch() is called at every epoch boundary so the shuffle seed changes,
-    # preventing chips from seeing the same ordering across epochs.
     train_sampler = DistributedSampler(
         train_dataset, num_replicas=world_size, rank=rank,
         shuffle=True, seed=42,
@@ -362,27 +348,23 @@ def train(index):
         val_dataset, num_replicas=world_size, rank=rank, shuffle=False,
     )
 
-    # num_workers=0: the dataset is a pre-tokenized in-memory tensor so
-    # __getitem__ is O(1) tensor slicing — background workers add no benefit
-    # and can deadlock when forked inside xmp.spawn child processes.
-    # MpDeviceLoader handles host→TPU transfer asynchronously regardless.
+    # pin_memory=True: pre-pins host tensors so CUDA DMA transfer is faster.
+    # num_workers > 0 is safe here (unlike inside xmp.spawn child processes).
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_config.batch_size,
         sampler=train_sampler,
         drop_last=True,
-        num_workers=0,
+        num_workers=train_config.num_workers,
+        pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_config.batch_size,
         sampler=val_sampler,
-        num_workers=0,
+        num_workers=train_config.num_workers,
+        pin_memory=True,
     )
-
-    # Wrap DataLoaders with MpDeviceLoader for efficient host-to-TPU transfer
-    train_device_loader = pl.MpDeviceLoader(train_loader, device)
-    val_device_loader = pl.MpDeviceLoader(val_loader, device)
 
     if is_master:
         print(f"\n  Train chunks: {len(train_dataset):,}")
@@ -394,8 +376,19 @@ def train(index):
 
     if train_config.compile:
         if is_master:
-            print("\nCompiling model with torch.compile (openxla backend)...")
-        model = torch.compile(model, backend='openxla')
+            print("\nCompiling model with torch.compile...")
+        model = torch.compile(model)
+
+    # Wrap with DDP after moving to device.
+    # DDP automatically averages gradients across ranks on backward().
+    # We use model.no_sync() during gradient accumulation micro-steps to
+    # suppress the allreduce until the final micro-step.
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank])
+
+    if is_master:
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\nModel on device. Trainable params: {n_params/1e6:.2f}M")
 
     # ---- Optimizer ----
     optimizer = configure_optimizer(model, train_config, is_master=is_master)
@@ -407,68 +400,55 @@ def train(index):
     best_val_loss = float('inf')
     tokens_processed = 0
     epoch = 0
-    # XLA scalar for deferred loss accumulation — stays on device until after
-    # xm.optimizer_step() to avoid splitting the compiled graph prematurely
-    step_loss_xla = torch.zeros((), device=device, dtype=torch.float32)
+    step_loss_accum = 0.0  # CPU float accumulator (unlike XLA, .item() is cheap on CUDA)
 
-    if is_master:
-        Path(train_config.output_dir).mkdir(exist_ok=True)
-    train_iter = iter(train_device_loader)
+    Path(train_config.output_dir).mkdir(exist_ok=True, parents=True)
+    train_iter = iter(train_loader)
 
-    # ---- Train ----
-    # Note: the first optimizer step will trigger XLA graph compilation, which
-    # can take several minutes.  This is a one-time cost per process restart.
     if is_master:
         print(f"\nStarting training for {train_config.max_steps:,} optimizer steps...")
-        print("(XLA graph compiles on the first step — expect a delay before the bar moves)\n")
     pbar = tqdm(total=train_config.max_steps, desc="Training") if is_master else None
     t0 = time.time()
 
     while optimizer_step < train_config.max_steps:
-        # Get batch (cycle through epochs)
-        # MpDeviceLoader handles host-to-device transfer automatically.
-        # set_epoch() updates DistributedSampler's shuffle seed each epoch so
-        # chips see different orderings and never repeat the same shard pairing.
+        # Get next batch, cycling through epochs
         try:
             x, y = next(train_iter)
         except StopIteration:
             epoch += 1
             train_sampler.set_epoch(epoch)
-            train_iter = iter(train_device_loader)
+            train_iter = iter(train_loader)
             x, y = next(train_iter)
 
-        # Forward + backward (micro-step)
-        # Model is already in bfloat16 on TPU — no autocast needed
-        _, loss = model(x, y)
-        scaled_loss = loss / train_config.gradient_accumulation_steps
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
-        # Accumulate loss on the XLA device — do NOT call .item() here.
-        step_loss_xla = step_loss_xla + scaled_loss.detach().float()
-        scaled_loss.backward()
+        is_last_micro_step = ((micro_step + 1) % train_config.gradient_accumulation_steps == 0)
+
+        # ---- Forward + backward (micro-step) ----
+        # Use model.no_sync() on all but the last micro-step to prevent DDP
+        # from doing an allreduce after each backward — we only want one
+        # allreduce per optimizer step, not per micro-step.
+        ctx = model.no_sync() if (world_size > 1 and not is_last_micro_step) else contextlib_nullcontext()
+
+        with ctx:
+            # te.fp8_autocast activates FP8 Tensor Core ops in all te.Linear
+            # and te.RMSNorm layers. Outside this context they run in BF16.
+            # The context must wrap only the forward pass — backward runs
+            # outside it (TE handles the backward scaling factors internally).
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                _, loss = model(x, y)
+
+            scaled_loss = loss / train_config.gradient_accumulation_steps
+            scaled_loss.backward()
+
+        step_loss_accum += scaled_loss.detach().float().item()
         micro_step += 1
         tokens_processed += x.numel()
 
-        # Between gradient accumulation micro-steps (but NOT before the
-        # optimizer step), flush the XLA graph so activations from this
-        # micro-step are freed before the next one is traced.  Without this,
-        # XLA lazily accumulates ALL micro-step graphs into one giant graph
-        # (gradient_accumulation_steps × the per-step graph size), which
-        # multiplies the compilation memory requirement by the accumulation
-        # factor.  Gradients are tensors on the device and survive mark_step.
-        is_last_micro_step = (micro_step % train_config.gradient_accumulation_steps == 0)
-        if not is_last_micro_step:
-            xm.mark_step()
-
-        # ---- Optimizer step (every gradient_accumulation_steps micro-steps) ----
-        if micro_step % train_config.gradient_accumulation_steps == 0:
-            # All-reduce gradients across chips before clipping.
-            # xm.reduce_gradients performs REDUCE_SUM / world_size so every
-            # chip gets the identical mean gradient.  This is a no-op when
-            # world_size == 1.  Must happen BEFORE clip_grad_norm_ so that
-            # clipping is applied to the globally averaged gradient.
-            xm.reduce_gradients(optimizer)
-
-            # Clip the averaged gradients.
+        # ---- Optimizer step ----
+        if is_last_micro_step:
+            # Gradient clipping — applied after DDP has allreduced gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), train_config.grad_clip
             )
@@ -478,26 +458,15 @@ def train(index):
             for pg in optimizer.param_groups:
                 pg['lr'] = lr
 
-            # xm.optimizer_step flushes the entire accumulated XLA graph
-            # (forward + backward + allreduce + clip + optimizer updates)
-            # in one compiled kernel.
-            xm.optimizer_step(optimizer)
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-            # ---- Logging ----
-            # Read loss AFTER the graph flush — step_loss_xla is now a
-            # materialized scalar; no live activations remain in TPU RAM.
-            local_avg_loss = step_loss_xla.item()
-            # Average training loss across chips for accurate global reporting
-            avg_loss = xm.mesh_reduce(
-                'train_loss', local_avg_loss,
-                lambda vals: sum(vals) / len(vals),
-            )
-            step_loss_xla = torch.zeros((), device=device, dtype=torch.float32)
+            # Average training loss across all ranks
+            loss_tensor = torch.tensor(step_loss_accum, device=device, dtype=torch.float32)
+            avg_loss = all_reduce_mean(loss_tensor)
+            step_loss_accum = 0.0
 
             dt = time.time() - t0
-            # Global token throughput: each chip processed tokens_processed
-            # tokens; multiply by world_size for total across all chips.
             tps = tokens_processed * world_size / dt if dt > 0 else 0
 
             if is_master:
@@ -515,9 +484,10 @@ def train(index):
 
             # ---- Validation ----
             if optimizer_step > 0 and optimizer_step % train_config.eval_interval == 0:
-                # evaluate() is a collective — all chips must call it together
-                val_loss = evaluate(model, val_device_loader, train_config)
+                # evaluate() calls dist.all_reduce — all ranks must enter together
+                val_loss = evaluate(model, val_loader, device, fp8_recipe)
                 val_ppl = math.exp(min(val_loss, 20))
+
                 if is_master:
                     wandb.log({
                         "val/loss": val_loss,
@@ -529,11 +499,10 @@ def train(index):
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_path = f"{train_config.output_dir}/laalm_v2_best.pt"
-                        # Move state dict to CPU for portable checkpoints
-                        cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
-                        xm.save({
+                        raw_model = model.module if isinstance(model, DDP) else model
+                        torch.save({
                             'optimizer_step': optimizer_step,
-                            'model_state_dict': cpu_state,
+                            'model_state_dict': raw_model.state_dict(),
                             'config': model_config,
                             'val_loss': val_loss,
                         }, best_path)
@@ -547,16 +516,11 @@ def train(index):
             # ---- Checkpoint ----
             if is_master and optimizer_step > 0 and optimizer_step % train_config.save_interval == 0:
                 ckpt_path = f"{train_config.output_dir}/checkpoint_{optimizer_step}.pt"
-                cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
-                cpu_opt_state = {
-                    k: {sk: sv.cpu() if torch.is_tensor(sv) else sv
-                        for sk, sv in v.items()} if isinstance(v, dict) else v
-                    for k, v in optimizer.state_dict().items()
-                }
-                xm.save({
+                raw_model = model.module if isinstance(model, DDP) else model
+                torch.save({
                     'optimizer_step': optimizer_step,
-                    'model_state_dict': cpu_state,
-                    'optimizer_state_dict': cpu_opt_state,
+                    'model_state_dict': raw_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
                     'config': model_config,
                     'best_val_loss': best_val_loss,
                 }, ckpt_path)
@@ -569,16 +533,15 @@ def train(index):
     if pbar is not None:
         pbar.close()
 
-    # ---- Final save & eval ----
-    # evaluate() is collective — all chips participate; only master saves.
-    final_val = evaluate(model, val_device_loader, train_config)
+    # ---- Final eval & save ----
+    final_val = evaluate(model, val_loader, device, fp8_recipe)
     final_ppl = math.exp(min(final_val, 20))
 
     if is_master:
+        raw_model = model.module if isinstance(model, DDP) else model
         final_path = f"{train_config.output_dir}/laalm_v2_final.pt"
-        cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
-        xm.save({
-            'model_state_dict': cpu_state,
+        torch.save({
+            'model_state_dict': raw_model.state_dict(),
             'config': model_config,
             'best_val_loss': best_val_loss,
         }, final_path)
@@ -596,21 +559,15 @@ def train(index):
 
         wandb.finish()
 
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
+# Small helper — contextlib.nullcontext equivalent inline
+class contextlib_nullcontext:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+
 
 if __name__ == "__main__":
-    # With the PJRT runtime (libtpu.so), xmp.spawn deadlocks: it spawns one
-    # child process per chip and each child tries to init the TPU runtime via
-    # libtpu simultaneously, causing them to block on each other.  Also, any
-    # XLA/XR call made in the parent process before xmp.spawn (e.g. to detect
-    # nprocs) marks the runtime as initialized and causes xmp.spawn to raise
-    # "Runtime is already initialized."
-    #
-    # The correct approach for single-machine PJRT training: call train()
-    # directly from the parent process.  xm.xla_device() returns the single
-    # local TPU device, xr.world_size() == 1, and all collective ops
-    # (reduce_gradients, mesh_reduce) are no-ops — so the rest of the training
-    # code works unchanged.
-    #
-    # For multi-process PJRT training use torchrun:
-    #   torchrun --nproc_per_node=4 train.py
-    train(0)
+    train()
