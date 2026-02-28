@@ -4,3 +4,4 @@ tokenizers>=0.15.0
 safetensors>=0.4.0
 wandb>=0.16.0
 tqdm>=4.60.0
+transformer-engine[pytorch]
