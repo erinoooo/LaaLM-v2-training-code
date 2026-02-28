@@ -23,6 +23,7 @@ Multi-chip:  xmp.spawn launches one worker process per chip.  Each worker
              before every optimizer update.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -313,10 +314,15 @@ def train(index):
         wandb_config['effective_batch_size'] = eff_batch
         wandb_config['tokens_per_step'] = tokens_per_step
         wandb_config['world_size'] = world_size
+        # Default to offline mode so wandb never blocks on network I/O.
+        # Cloud TPU VMs often can't reach wandb servers.
+        # To sync later:  wandb sync ./wandb/run-*/
+        # To use online:  WANDB_MODE=online python train.py
         wandb.init(
             project=train_config.wandb_project,
             name=train_config.wandb_run_name,
             config=wandb_config,
+            mode=os.environ.get("WANDB_MODE", "offline"),
         )
 
     # ---- Data ----
@@ -360,24 +366,22 @@ def train(index):
         val_dataset, num_replicas=world_size, rank=rank, shuffle=False,
     )
 
-    # num_workers > 0 lets the host prefetch data on background threads so
-    # the TPU never idles waiting for the next batch.
-    # persistent_workers keeps the worker processes alive across epochs,
-    # avoiding re-spawn overhead at every StopIteration.
+    # num_workers=0: the dataset is a pre-tokenized in-memory tensor so
+    # __getitem__ is O(1) tensor slicing — background workers add no benefit
+    # and can deadlock when forked inside xmp.spawn child processes.
+    # MpDeviceLoader handles host→TPU transfer asynchronously regardless.
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_config.batch_size,
         sampler=train_sampler,
         drop_last=True,
-        num_workers=4,
-        persistent_workers=True,
+        num_workers=0,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_config.batch_size,
         sampler=val_sampler,
-        num_workers=4,
-        persistent_workers=True,
+        num_workers=0,
     )
 
     # Wrap DataLoaders with MpDeviceLoader for efficient host-to-TPU transfer
