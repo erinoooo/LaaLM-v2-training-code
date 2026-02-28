@@ -314,15 +314,11 @@ def train(index):
         wandb_config['effective_batch_size'] = eff_batch
         wandb_config['tokens_per_step'] = tokens_per_step
         wandb_config['world_size'] = world_size
-        # Default to offline mode so wandb never blocks on network I/O.
-        # Cloud TPU VMs often can't reach wandb servers.
-        # To sync later:  wandb sync ./wandb/run-*/
-        # To use online:  WANDB_MODE=online python train.py
         wandb.init(
             project=train_config.wandb_project,
             name=train_config.wandb_run_name,
             config=wandb_config,
-            mode=os.environ.get("WANDB_MODE", "offline"),
+            mode="disabled",
         )
 
     # ---- Data ----
@@ -602,9 +598,23 @@ def train(index):
 
 
 if __name__ == "__main__":
-    # xmp.spawn launches one worker process per TPU chip and injects the chip
-    # ordinal as the first argument to train().  nprocs=None lets torch_xla
-    # auto-detect the number of available TPU cores (4 on a v2-4/v3-4, 8 on
-    # v3-8, etc.).  If auto-detection fails, set nprocs explicitly, e.g.:
-    #   xmp.spawn(train, args=(), nprocs=4)
-    xmp.spawn(train, args=(), nprocs=None)
+    # With the PJRT runtime (libtpu.so), passing nprocs=None to xmp.spawn
+    # triggers XLA's internal device-count auto-detection, which deadlocks
+    # because libtpu has already started initializing on import.  Instead,
+    # query the count explicitly via xr.addressable_device_count() *before*
+    # spawning.  If that also fails (e.g. emulated TPU, unit tests), fall back
+    # to nprocs=1.
+    try:
+        nprocs = xr.addressable_device_count()
+    except Exception:
+        nprocs = 1
+    if nprocs <= 0:
+        nprocs = 1
+
+    if nprocs > 1:
+        # Multi-chip: spawn one process per chip.
+        xmp.spawn(train, args=(), nprocs=nprocs)
+    else:
+        # Single chip: call train() directly — avoids the xmp.spawn
+        # multiprocessing overhead and any PJRT fork-safety issues.
+        train(0)
