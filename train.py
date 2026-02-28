@@ -67,8 +67,11 @@ class TrainConfig:
     val_split_ratio: float = 0.05  # Fallback if val file doesn't exist
 
     # Training — all step counts are OPTIMIZER steps (not micro-batches)
-    batch_size: int = 128
-    gradient_accumulation_steps: int = 1
+    # batch=32 × accum=4 = effective batch of 128.
+    # Each attention score tensor is [32,4,1024,1024] = 256 MB (bf16)
+    # instead of [128,4,1024,1024] = 1 GB, cutting peak memory ~4×.
+    batch_size: int = 32
+    gradient_accumulation_steps: int = 4
     max_steps: int = 50000   # 50K optimizer steps
     warmup_steps: int = 3000
     eval_interval: int = 500
