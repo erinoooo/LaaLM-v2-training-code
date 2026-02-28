@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 
 # ============================================================================
@@ -30,6 +31,10 @@ class LaaLMConfig:
     max_seq_len: int
     dropout: float = 0.1
     use_swiglu: bool = False
+    # Recompute layer activations during backward instead of storing all
+    # n_layers worth simultaneously.  Cuts activation memory from
+    # O(n_layers) to O(1) at the cost of one extra forward pass per layer.
+    use_gradient_checkpointing: bool = False
 
     def __post_init__(self):
         """Validate configuration and compute derived values."""
@@ -67,19 +72,20 @@ class LaaLMv2Config(LaaLMConfig):
 
     v2 uses:
     - 8K vocab with BPE tokenization
-    - 1024 hidden dim, 20 layers, 16 heads (~265M parameters)
-    - SwiGLU FFN with d_ff=2816 (8/3 * d_model, rounded to multiple of 256)
-    - 8192 max sequence length for extended conversation context
+    - 128 hidden dim, 12 layers, 4 heads (~3.4M parameters)
+    - SwiGLU FFN with d_ff=352 (8/3 * d_model, rounded to multiple of 32)
+    - 1024 max sequence length
     - Trained on unambiguous delimiter format with reasoning traces
     """
     vocab_size: int = 8000
-    d_model: int = 1024
-    n_layers: int = 20
-    n_heads: int = 16
-    d_ff: int = 2816
+    d_model: int = 128
+    n_layers: int = 12
+    n_heads: int = 4
+    d_ff: int = 352
     max_seq_len: int = 1024
     dropout: float = 0.05
     use_swiglu: bool = True
+    use_gradient_checkpointing: bool = False  # model is small enough without it
 
 
 # ============================================================================
@@ -280,7 +286,13 @@ class LaaLMModel(nn.Module):
 
         # Transformer blocks
         for block in self.blocks:
-            x = block(x)
+            if self.config.use_gradient_checkpointing and self.training:
+                # use_reentrant=False is the recommended API for XLA/TPU:
+                # it doesn't rely on Python re-entrancy and traces correctly
+                # under XLA's lazy evaluation model.
+                x = gradient_checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         # Final norm and projection
         x = self.norm_f(x)
