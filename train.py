@@ -41,6 +41,7 @@ try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
     import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.runtime as xr
 except ImportError as e:
     _msg = str(e)
     if "undefined symbol" in _msg or "_XLAC" in _msg:
@@ -183,7 +184,7 @@ def get_lr(optimizer_step, config):
 # OPTIMIZER WITH PROPER WEIGHT DECAY
 # ============================================================================
 
-def configure_optimizer(model, config):
+def configure_optimizer(model, config, is_master=True):
     """Create AdamW with proper weight decay groups.
 
     2D parameters (weight matrices) get weight decay.
@@ -202,7 +203,8 @@ def configure_optimizer(model, config):
 
     n_decay = sum(p.numel() for p in decay_params)
     n_no_decay = sum(p.numel() for p in no_decay_params)
-    xm.master_print(f"  Weight decay: {n_decay:,} params | No decay: {n_no_decay:,} params")
+    if is_master:
+        print(f"  Weight decay: {n_decay:,} params | No decay: {n_no_decay:,} params")
 
     return torch.optim.AdamW(
         [
@@ -270,11 +272,12 @@ def train(index):
     # ---- TPU device & distributed setup ----
     device = xm.xla_device()
     train_config.device = device
-    world_size = xm.xrt_world_size()
-    rank = xm.get_ordinal()
-    is_master = xm.is_master_ordinal()
+    world_size = xr.world_size()
+    rank = xr.global_ordinal()
+    is_master = (rank == 0)
 
-    xm.master_print(f"Distributed setup: {world_size} TPU chip(s) — rank {rank} on {device}")
+    if is_master:
+        print(f"Distributed setup: {world_size} TPU chip(s) — rank {rank} on {device}")
 
     if is_master:
         print("=" * 60)
@@ -322,7 +325,8 @@ def train(index):
     # Each chip loads its own copy of the dataset (independent I/O).
     # Only the master chip prints progress to avoid 4× duplicate output.
     if Path(train_config.val_data_path).exists():
-        xm.master_print("Using existing validation split")
+        if is_master:
+            print("Using existing validation split")
         train_dataset = LaaLMDataset(
             train_config.data_path, tokenizer,
             max_len=model_config.max_seq_len, verbose=is_master,
@@ -332,7 +336,8 @@ def train(index):
             max_len=model_config.max_seq_len, verbose=False,
         )
     else:
-        xm.master_print(f"No val split found — holding out {train_config.val_split_ratio*100:.0f}%")
+        if is_master:
+            print(f"No val split found — holding out {train_config.val_split_ratio*100:.0f}%")
         full_dataset = LaaLMDataset(
             train_config.data_path, tokenizer,
             max_len=model_config.max_seq_len, verbose=is_master,
@@ -379,19 +384,21 @@ def train(index):
     train_device_loader = pl.MpDeviceLoader(train_loader, device)
     val_device_loader = pl.MpDeviceLoader(val_loader, device)
 
-    xm.master_print(f"\n  Train chunks: {len(train_dataset):,}")
-    xm.master_print(f"  Val chunks:   {len(val_dataset):,}")
+    if is_master:
+        print(f"\n  Train chunks: {len(train_dataset):,}")
+        print(f"  Val chunks:   {len(val_dataset):,}")
 
     # ---- Model ----
     model = LaaLMModel(model_config)
     model = model.to(train_config.dtype).to(device)
 
     if train_config.compile:
-        xm.master_print("\nCompiling model with torch.compile (openxla backend)...")
+        if is_master:
+            print("\nCompiling model with torch.compile (openxla backend)...")
         model = torch.compile(model, backend='openxla')
 
     # ---- Optimizer ----
-    optimizer = configure_optimizer(model, train_config)
+    optimizer = configure_optimizer(model, train_config, is_master=is_master)
 
     # ---- Training state ----
     model.train()
@@ -408,15 +415,12 @@ def train(index):
         Path(train_config.output_dir).mkdir(exist_ok=True)
     train_iter = iter(train_device_loader)
 
-    # ---- Initial validation ----
-    val_loss = evaluate(model, val_device_loader, train_config)
-    val_ppl = math.exp(min(val_loss, 20))
-    xm.master_print(f"\nInitial val loss: {val_loss:.4f} (ppl: {val_ppl:.2f})")
-    if is_master:
-        wandb.log({"val/loss": val_loss, "val/perplexity": val_ppl, "step": 0})
-
     # ---- Train ----
-    xm.master_print(f"\nStarting training for {train_config.max_steps:,} optimizer steps...\n")
+    # Note: the first optimizer step will trigger XLA graph compilation, which
+    # can take several minutes.  This is a one-time cost per process restart.
+    if is_master:
+        print(f"\nStarting training for {train_config.max_steps:,} optimizer steps...")
+        print("(XLA graph compiles on the first step — expect a delay before the bar moves)\n")
     pbar = tqdm(total=train_config.max_steps, desc="Training") if is_master else None
     t0 = time.time()
 
