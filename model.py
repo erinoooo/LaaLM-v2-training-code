@@ -72,20 +72,20 @@ class LaaLMv2Config(LaaLMConfig):
 
     v2 uses:
     - 8K vocab with BPE tokenization
-    - 1024 hidden dim, 20 layers, 16 heads (~265M parameters)
-    - SwiGLU FFN with d_ff=2816 (8/3 * d_model, rounded to multiple of 256)
-    - 8192 max sequence length for extended conversation context
+    - 128 hidden dim, 12 layers, 4 heads (~3.4M parameters)
+    - SwiGLU FFN with d_ff=352 (8/3 * d_model, rounded to multiple of 32)
+    - 1024 max sequence length
     - Trained on unambiguous delimiter format with reasoning traces
     """
     vocab_size: int = 8000
-    d_model: int = 1024
-    n_layers: int = 20
-    n_heads: int = 16
-    d_ff: int = 2816
+    d_model: int = 128
+    n_layers: int = 12
+    n_heads: int = 4
+    d_ff: int = 352
     max_seq_len: int = 1024
     dropout: float = 0.05
     use_swiglu: bool = True
-    use_gradient_checkpointing: bool = True  # required to fit 20 layers on 30 GB TPU
+    use_gradient_checkpointing: bool = False  # model is small enough without it
 
 
 # ============================================================================
