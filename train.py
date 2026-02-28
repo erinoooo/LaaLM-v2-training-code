@@ -23,7 +23,6 @@ Multi-chip:  xmp.spawn launches one worker process per chip.  Each worker
              before every optimizer update.
 """
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,7 +33,6 @@ import math
 import time
 from pathlib import Path
 from tqdm import tqdm
-import wandb
 from dataclasses import dataclass
 
 try:
@@ -103,8 +101,6 @@ class TrainConfig:
 
     # Checkpointing
     output_dir: str = "checkpoints_v2"
-    wandb_project: str = "laalm-v2"
-    wandb_run_name: str = "laalm-v2-quality"
 
 # ============================================================================
 # DATASET — PRE-TOKENIZED & CONCATENATED
@@ -271,6 +267,8 @@ def train(index):
     train_config = TrainConfig()
 
     # ---- TPU device & distributed setup ----
+    # xm.xla_device() is safe here — we are already inside a spawned child
+    # process that owns exactly one chip.
     device = xm.xla_device()
     train_config.device = device
     world_size = xr.world_size()
@@ -279,8 +277,6 @@ def train(index):
 
     if is_master:
         print(f"Distributed setup: {world_size} TPU chip(s) — rank {rank} on {device}")
-
-    if is_master:
         print("=" * 60)
         print("LaaLM-v2 Training — Quality Optimized (TPU)")
         print("=" * 60)
@@ -306,24 +302,6 @@ def train(index):
         print(f"  LR:              {train_config.learning_rate} -> "
               f"{train_config.learning_rate * train_config.min_lr_ratio}")
         print()
-
-    # ---- Wandb (master only) ----
-    if is_master:
-        wandb_config = {**model_config.__dict__, **train_config.__dict__}
-        wandb_config['dtype'] = str(train_config.dtype)
-        wandb_config['effective_batch_size'] = eff_batch
-        wandb_config['tokens_per_step'] = tokens_per_step
-        wandb_config['world_size'] = world_size
-        # Default to offline mode so wandb never blocks on network I/O.
-        # Cloud TPU VMs often can't reach wandb servers.
-        # To sync later:  wandb sync ./wandb/run-*/
-        # To use online:  WANDB_MODE=online python train.py
-        wandb.init(
-            project=train_config.wandb_project,
-            name=train_config.wandb_run_name,
-            config=wandb_config,
-            mode=os.environ.get("WANDB_MODE", "offline"),
-        )
 
     # ---- Data ----
     tokenizer = Tokenizer.from_file(train_config.tokenizer_path)
@@ -389,7 +367,7 @@ def train(index):
     val_device_loader = pl.MpDeviceLoader(val_loader, device)
 
     if is_master:
-        print(f"\n  Train chunks: {len(train_dataset):,}")
+        print(f"  Train chunks: {len(train_dataset):,}")
         print(f"  Val chunks:   {len(val_dataset):,}")
 
     # ---- Model ----
@@ -420,11 +398,11 @@ def train(index):
     train_iter = iter(train_device_loader)
 
     # ---- Train ----
-    # Note: the first optimizer step will trigger XLA graph compilation, which
-    # can take several minutes.  This is a one-time cost per process restart.
+    # The first optimizer step triggers XLA graph tracing + compilation.
+    # This is a one-time cost — expect several minutes before the bar moves.
     if is_master:
         print(f"\nStarting training for {train_config.max_steps:,} optimizer steps...")
-        print("(XLA graph compiles on the first step — expect a delay before the bar moves)\n")
+        print("(first step compiles the XLA graph — bar will appear after compilation)\n")
     pbar = tqdm(total=train_config.max_steps, desc="Training") if is_master else None
     t0 = time.time()
 
@@ -505,14 +483,6 @@ def train(index):
             tps = tokens_processed * world_size / dt if dt > 0 else 0
 
             if is_master:
-                wandb.log({
-                    "train/loss": avg_loss,
-                    "train/perplexity": math.exp(min(avg_loss, 20)),
-                    "train/lr": lr,
-                    "train/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
-                    "train/tokens_per_sec": tps,
-                    "step": optimizer_step,
-                })
                 pbar.set_description(
                     f"loss={avg_loss:.4f} lr={lr:.1e} tps={tps:.0f}"
                 )
@@ -523,12 +493,6 @@ def train(index):
                 val_loss = evaluate(model, val_device_loader, train_config)
                 val_ppl = math.exp(min(val_loss, 20))
                 if is_master:
-                    wandb.log({
-                        "val/loss": val_loss,
-                        "val/perplexity": val_ppl,
-                        "step": optimizer_step,
-                    })
-
                     improved = ""
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
@@ -598,13 +562,12 @@ def train(index):
         print(f"  Final model:     {final_path}")
         print("=" * 60)
 
-        wandb.finish()
-
 
 if __name__ == "__main__":
-    # xmp.spawn launches one worker process per TPU chip and injects the chip
-    # ordinal as the first argument to train().  nprocs=None lets torch_xla
-    # auto-detect the number of available TPU cores (4 on a v2-4/v3-4, 8 on
-    # v3-8, etc.).  If auto-detection fails, set nprocs explicitly, e.g.:
-    #   xmp.spawn(train, args=(), nprocs=4)
-    xmp.spawn(train, args=(), nprocs=None)
+    # nprocs must be explicit — nprocs=None causes torch_xla to call
+    # xm.xrt_world_size() in the PARENT process to auto-detect chip count,
+    # which initialises the PJRT runtime before forking and deadlocks on
+    # some Cloud TPU VM configurations.  Set this to match your TPU topology:
+    #   v2-8 / v3-8  → nprocs=8
+    #   v2-4 / v4-8  → nprocs=4
+    xmp.spawn(train, args=(), nprocs=4)
