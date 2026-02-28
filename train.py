@@ -598,23 +598,19 @@ def train(index):
 
 
 if __name__ == "__main__":
-    # With the PJRT runtime (libtpu.so), passing nprocs=None to xmp.spawn
-    # triggers XLA's internal device-count auto-detection, which deadlocks
-    # because libtpu has already started initializing on import.  Instead,
-    # query the count explicitly via xr.addressable_device_count() *before*
-    # spawning.  If that also fails (e.g. emulated TPU, unit tests), fall back
-    # to nprocs=1.
-    try:
-        nprocs = xr.addressable_device_count()
-    except Exception:
-        nprocs = 1
-    if nprocs <= 0:
-        nprocs = 1
-
-    if nprocs > 1:
-        # Multi-chip: spawn one process per chip.
-        xmp.spawn(train, args=(), nprocs=nprocs)
-    else:
-        # Single chip: call train() directly — avoids the xmp.spawn
-        # multiprocessing overhead and any PJRT fork-safety issues.
-        train(0)
+    # With the PJRT runtime (libtpu.so), xmp.spawn deadlocks: it spawns one
+    # child process per chip and each child tries to init the TPU runtime via
+    # libtpu simultaneously, causing them to block on each other.  Also, any
+    # XLA/XR call made in the parent process before xmp.spawn (e.g. to detect
+    # nprocs) marks the runtime as initialized and causes xmp.spawn to raise
+    # "Runtime is already initialized."
+    #
+    # The correct approach for single-machine PJRT training: call train()
+    # directly from the parent process.  xm.xla_device() returns the single
+    # local TPU device, xr.world_size() == 1, and all collective ops
+    # (reduce_gradients, mesh_reduce) are no-ops — so the rest of the training
+    # code works unchanged.
+    #
+    # For multi-process PJRT training use torchrun:
+    #   torchrun --nproc_per_node=4 train.py
+    train(0)
