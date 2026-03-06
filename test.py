@@ -1,135 +1,109 @@
 """
-LaaLM-v2 Interactive Inference (TPU)
-Uses v3 delimiter format matching training data
+LaaLM-v2 Interactive Inference
+Runs on CUDA if available, falls back to CPU.
+
+Changes from original:
+  - Removed torch_xla / TPU backend entirely
+  - Generation loop now uses model._forward_with_hidden() for incremental
+    hidden-state updates — no redundant re-encoding of the full context
 """
 
+import os
 import torch
 from tokenizers import Tokenizer
 
-try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-except ImportError as e:
-    _msg = str(e)
-    if "undefined symbol" in _msg or "_XLAC" in _msg:
-        raise SystemExit(
-            "\n[ERROR] torch_xla version mismatch with torch.\n"
-            "torch and torch_xla must be exactly the same version.\n\n"
-            "Fix — run these commands in your venv:\n"
-            "  pip show torch               # note the version (e.g. 2.5.1)\n"
-            "  pip uninstall torch_xla -y\n"
-            "  pip install torch_xla==<same-version-as-torch>\n\n"
-            "Or reinstall both together:\n"
-            "  pip install torch==2.5.1 torch_xla==2.5.0\n\n"
-            f"Original error: {_msg}"
-        ) from None
-    raise
-
 from model import LaaLMv2Config, LaaLMModel
 
-# ============================================================================
-# INFERENCE ENGINE
-# ============================================================================
 
 class LaaLMTerminal:
-    def __init__(self, checkpoint_path, tokenizer_path, device=None):
-        self.device = device if device is not None else xm.xla_device()
+    def __init__(self, checkpoint_path: str, tokenizer_path: str, device=None):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+        print(f"Device: {self.device}")
+
         print("Loading tokenizer...")
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
 
         print("Loading model...")
-        # Load checkpoint to CPU first, then move to TPU
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        config = checkpoint['config']
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        config = checkpoint["config"]
 
         self.model = LaaLMModel(config)
-        state_dict = checkpoint['model_state_dict']
-        cleaned_state = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-        self.model.load_state_dict(cleaned_state)
+        state = {k.replace("_orig_mod.", ""): v
+                 for k, v in checkpoint["model_state_dict"].items()}
+        self.model.load_state_dict(state)
         self.model = self.model.to(torch.bfloat16).to(self.device).eval()
 
-        print(f"Model loaded: {config.n_params/1e6:.1f}M parameters")
+        print(f"Model loaded: {config.n_params / 1e6:.1f}M parameters")
 
-        self.max_seq_len = config.max_seq_len
-        self.conversation = []
-        # System prompt matches training data format exactly
-        self.system_prompt = (
+        self.max_seq_len    = config.max_seq_len
+        self.conversation   = []
+        self.system_prompt  = (
             "### SYSTEM ###\n"
             "CWD=/home/user\n"
             "FILES=[]\n"
             "ENV=USER:user,HOME:/home/user\n"
             "### END SYSTEM ###"
         )
+        self._end_output   = "### END OUTPUT ###"
+        self._end_command  = "### END COMMAND ###"
 
-        # Cache delimiter token sequences for stop detection
-        self._end_output_str = "### END OUTPUT ###"
-        self._end_command_str = "### END COMMAND ###"
+    # ------------------------------------------------------------------
 
-    def run_command(self, command, max_tokens=200):
-        """Run command using the v3 delimiter format matching training data"""
-
-        # Build conversation in the exact format the model was trained on
-        conv_text = self.system_prompt + "\n\n"
+    def run_command(self, command: str, max_tokens: int = 200) -> str:
+        # Build context string in training format
+        ctx = self.system_prompt + "\n\n"
         for prev_cmd, prev_out in self.conversation:
-            conv_text += f"### COMMAND ###\n{prev_cmd}\n### END COMMAND ###\n\n"
-            conv_text += f"### OUTPUT ###\n{prev_out}\n### END OUTPUT ###\n\n"
+            ctx += f"### COMMAND ###\n{prev_cmd}\n### END COMMAND ###\n\n"
+            ctx += f"### OUTPUT ###\n{prev_out}\n### END OUTPUT ###\n\n"
+        ctx += f"### COMMAND ###\n{command}\n### END COMMAND ###\n\n"
+        ctx += "### OUTPUT ###\n"
 
-        # Add the new command and prompt for output
-        conv_text += f"### COMMAND ###\n{command}\n### END COMMAND ###\n\n"
-        conv_text += "### OUTPUT ###\n"
-
-        # Tokenize (keep last max_seq_len tokens for context window)
-        encoded = self.tokenizer.encode(conv_text)
+        # Tokenise — keep last max_seq_len tokens
+        enc       = self.tokenizer.encode(ctx)
         input_ids = torch.tensor(
-            [encoded.ids[-self.max_seq_len:]], dtype=torch.long
+            [enc.ids[-self.max_seq_len:]], dtype=torch.long
         ).to(self.device)
 
-        # Generate
-        generated_tokens = []
+        # Prime hidden state from the full prompt, then generate token-by-token
+        generated = []
+        hidden    = None
+
         with torch.no_grad():
+            # Encode prompt (all but last token) to get hidden state
+            if input_ids.size(1) > 1:
+                emb = self.model.emb_drop(self.model.token_emb(input_ids[:, :-1]))
+                _, hidden = self.model.lstm(emb, hidden)
+
+            current = input_ids[:, -1:]   # (1, 1)
+
             for step in range(max_tokens):
-                logits, _ = self.model(input_ids)
-                next_token = logits[:, -1, :].argmax(dim=-1)
+                logits, hidden = self.model._forward_with_hidden(current, hidden)
+                next_id = logits[:, -1, :].argmax(dim=-1)
 
-                generated_tokens.append(next_token.item())
-                response_so_far = self.tokenizer.decode(generated_tokens)
+                generated.append(next_id.item())
+                response = self.tokenizer.decode(generated)
 
-                # Stop if we see the end-of-output delimiter
-                if self._end_output_str in response_so_far:
+                if self._end_output in response:
+                    break
+                if "### COMMAND ###" in response:
+                    break
+                if next_id.item() == 3:          # EOS
+                    break
+                if step > 150 and len(response.strip()) > 100:
                     break
 
-                # Stop if we see the start of a new command block
-                if "### COMMAND ###" in response_so_far:
-                    break
+                current = next_id.unsqueeze(0)   # (1, 1)
 
-                # Stop on EOS token (id=3)
-                if next_token.item() == 3:
-                    break
-
-                # Safety: stop if response is very long with content
-                if step > 150 and len(response_so_far.strip()) > 100:
-                    break
-
-                # Continue generation
-                input_ids = torch.cat(
-                    [input_ids, next_token.unsqueeze(0)], dim=1
-                )
-
-        # Clean response: extract content before end delimiter
-        response = self.tokenizer.decode(generated_tokens).strip()
-
-        # Remove any trailing delimiter markers
-        if self._end_output_str in response:
-            response = response.split(self._end_output_str)[0]
+        response = self.tokenizer.decode(generated).strip()
+        if self._end_output in response:
+            response = response.split(self._end_output)[0]
         if "### COMMAND ###" in response:
             response = response.split("### COMMAND ###")[0]
-
         response = response.strip()
 
-        # Save to conversation history
         self.conversation.append((command, response))
-
-        # Keep conversation from getting too long
         if len(self.conversation) > 20:
             self.conversation = self.conversation[-15:]
 
@@ -139,41 +113,42 @@ class LaaLMTerminal:
         self.conversation = []
         print("Conversation reset")
 
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
 def main():
     print("=" * 60)
     print("LaaLM-v2 Interactive Terminal")
     print("=" * 60)
     print()
 
-    # Prefer best model (lowest val loss) if available, fall back to final
-    import os
-    best_path = "checkpoints_v2/laalm_v2_best.pt"
+    best_path  = "checkpoints_v2/laalm_v2_best.pt"
     final_path = "checkpoints_v2/laalm_v2_final.pt"
-    checkpoint_path = best_path if os.path.exists(best_path) else final_path
+    ckpt       = best_path if os.path.exists(best_path) else final_path
 
     terminal = LaaLMTerminal(
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=ckpt,
         tokenizer_path="laalm_v2_tokenizer_v3.json",
-        device=xm.xla_device(),
     )
 
     print()
     print("=" * 60)
     print("Ready! Type bash commands")
-    print("Commands: 'reset' (clear), 'exit' (quit)")
+    print("Commands: 'reset' (clear history), 'exit' (quit)")
     print("=" * 60)
     print()
 
     while True:
         try:
             command = input("$ ").strip()
-
             if not command:
                 continue
-            if command.lower() in ['exit', 'quit']:
+            if command.lower() in ("exit", "quit"):
                 print("\nGoodbye!")
                 break
-            if command.lower() == 'reset':
+            if command.lower() == "reset":
                 terminal.reset()
                 continue
 
@@ -188,6 +163,7 @@ def main():
             print(f"Error: {e}")
             import traceback
             traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()
