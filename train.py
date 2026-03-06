@@ -68,8 +68,8 @@ class TrainConfig:
     val_split_ratio: float = 0.05
 
     # Training
-    batch_size:                  int   = 64
-    gradient_accumulation_steps: int   = 2
+    batch_size:                  int   = 384
+    gradient_accumulation_steps: int   = 1
     max_steps:                   int   = 50000
     warmup_steps:                int   = 3000
     eval_interval:               int   = 500
@@ -85,7 +85,7 @@ class TrainConfig:
 
     # System
     dtype:       torch.dtype = torch.bfloat16
-    num_workers: int         = 8
+    num_workers: int         = 64
     compile:     bool        = True   # torch.compile mode="reduce-overhead"
 
     # Checkpointing / logging
